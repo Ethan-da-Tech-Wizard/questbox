@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""
+questbox (qb) -- a personal question-tracking CLI backed by SQLite.
+
+File every question you ask into a real database, then query the scope and
+flow of your own thinking with SQL. See `qb --help` and README.md.
+"""
+import argparse
+import os
+import sqlite3
+import sys
+from datetime import datetime, timedelta
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get("QUESTBOX_DB", os.path.join(HERE, "questbox.db"))
+SCHEMA_PATH = os.path.join(HERE, "schema.sql")
+DEFAULT_SESSION_GAP_MIN = 20  # questions within this many minutes = same burst
+
+
+def connect():
+    if not os.path.exists(DB_PATH):
+        sys.exit(f"No database at {DB_PATH}. Run `qb init` first.")
+    con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA foreign_keys = ON")
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def print_table(headers, rows):
+    if not rows:
+        print("(no rows)")
+        return
+    cols = [list(map(str, [h] + [r[i] for r in rows])) for i, h in enumerate(headers)]
+    widths = [max(len(c) for c in col) for col in cols]
+    def fmt(vals):
+        return "  ".join(str(v).ljust(w) for v, w in zip(vals, widths))
+    print(fmt(headers))
+    print("  ".join("-" * w for w in widths))
+    for r in rows:
+        print(fmt(r))
+
+
+def get_or_create(con, table, name):
+    if name is None:
+        return None
+    cur = con.execute(f"SELECT id FROM {table} WHERE name = ?", (name,))
+    row = cur.fetchone()
+    if row:
+        return row["id"]
+    cur = con.execute(f"INSERT INTO {table}(name) VALUES (?)", (name,))
+    return cur.lastrowid
+
+
+def resolve_session(con, gap_minutes):
+    """Reuse the most recent session if the last question was asked within
+    gap_minutes; otherwise start a new one. This is what auto-detects bursts."""
+    cur = con.execute("SELECT id, created_at, session_id FROM questions ORDER BY id DESC LIMIT 1")
+    last = cur.fetchone()
+    now = datetime.now()
+    if last and last["session_id"] is not None:
+        last_time = datetime.strptime(last["created_at"], "%Y-%m-%dT%H:%M:%S")
+        if now - last_time <= timedelta(minutes=gap_minutes):
+            con.execute("UPDATE sessions SET ended_at = ? WHERE id = ?", (now_str(), last["session_id"]))
+            return last["session_id"]
+    cur = con.execute("INSERT INTO sessions(started_at, ended_at) VALUES (?, ?)", (now_str(), now_str()))
+    return cur.lastrowid
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(args):
+    if os.path.exists(DB_PATH) and not args.force:
+        sys.exit(f"{DB_PATH} already exists. Pass --force to reapply schema (safe: uses IF NOT EXISTS).")
+    con = sqlite3.connect(DB_PATH)
+    with open(SCHEMA_PATH) as f:
+        con.executescript(f.read())
+    con.commit()
+    con.close()
+    print(f"Initialized {DB_PATH}")
+
+
+def cmd_add(args):
+    con = connect()
+    category_id = get_or_create(con, "categories", args.category) if args.category else None
+    session_id = None if args.no_session else resolve_session(con, args.session_gap)
+    cur = con.execute(
+        "INSERT INTO questions(text, category_id, energy_level, parent_id, session_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (args.text, category_id, args.energy, args.parent, session_id),
+    )
+    qid = cur.lastrowid
+    if args.tags:
+        for tag in [t.strip() for t in args.tags.split(",") if t.strip()]:
+            tag_id = get_or_create(con, "tags", tag)
+            con.execute("INSERT OR IGNORE INTO question_tags(question_id, tag_id) VALUES (?, ?)", (qid, tag_id))
+    con.commit()
+    print(f"#{qid} filed.")
+
+
+def cmd_answer(args):
+    con = connect()
+    con.execute(
+        "UPDATE questions SET answer = ?, answered_at = ?, status = 'answered' WHERE id = ?",
+        (args.text, now_str(), args.id),
+    )
+    con.commit()
+    print(f"#{args.id} marked answered.")
+
+
+def cmd_status(args):
+    con = connect()
+    con.execute("UPDATE questions SET status = ? WHERE id = ?", (args.status, args.id))
+    con.commit()
+    print(f"#{args.id} -> {args.status}")
+
+
+def cmd_tag(args):
+    con = connect()
+    for tag in [t.strip() for t in args.tags.split(",") if t.strip()]:
+        tag_id = get_or_create(con, "tags", tag)
+        con.execute("INSERT OR IGNORE INTO question_tags(question_id, tag_id) VALUES (?, ?)", (args.id, tag_id))
+    con.commit()
+    print(f"#{args.id} tagged: {args.tags}")
+
+
+def cmd_untag(args):
+    con = connect()
+    for tag in [t.strip() for t in args.tags.split(",") if t.strip()]:
+        con.execute(
+            "DELETE FROM question_tags WHERE question_id = ? AND tag_id = (SELECT id FROM tags WHERE name = ?)",
+            (args.id, tag),
+        )
+    con.commit()
+    print(f"#{args.id} untagged: {args.tags}")
+
+
+def cmd_link(args):
+    con = connect()
+    con.execute("UPDATE questions SET parent_id = ? WHERE id = ?", (args.parent_id, args.child_id))
+    con.commit()
+    print(f"#{args.child_id} linked as follow-up of #{args.parent_id}")
+
+
+def cmd_list(args):
+    con = connect()
+    clauses, params = [], []
+    if args.status:
+        clauses.append("q.status = ?"); params.append(args.status)
+    if args.category:
+        clauses.append("c.name = ?"); params.append(args.category)
+    if args.tag:
+        clauses.append("q.id IN (SELECT question_id FROM question_tags qt JOIN tags t ON t.id = qt.tag_id WHERE t.name = ?)")
+        params.append(args.tag)
+    if args.today:
+        clauses.append("date(q.created_at) = date('now', 'localtime')")
+    if args.since:
+        clauses.append("date(q.created_at) >= date(?)"); params.append(args.since)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = con.execute(
+        f"""SELECT q.id, q.created_at, q.status, coalesce(c.name,'') AS category, q.text
+            FROM questions q LEFT JOIN categories c ON c.id = q.category_id
+            {where} ORDER BY q.id DESC LIMIT ?""",
+        params + [args.limit],
+    ).fetchall()
+    print_table(["id", "created_at", "status", "category", "text"],
+                [[r["id"], r["created_at"], r["status"], r["category"], r["text"][:70]] for r in rows])
+
+
+def cmd_show(args):
+    con = connect()
+    q = con.execute("""SELECT q.*, c.name AS category FROM questions q
+                        LEFT JOIN categories c ON c.id = q.category_id WHERE q.id = ?""", (args.id,)).fetchone()
+    if not q:
+        sys.exit(f"No question #{args.id}")
+    tags = [r["name"] for r in con.execute(
+        "SELECT t.name FROM question_tags qt JOIN tags t ON t.id = qt.tag_id WHERE qt.question_id = ?", (args.id,))]
+    children = con.execute("SELECT id, text FROM questions WHERE parent_id = ?", (args.id,)).fetchall()
+    print(f"#{q['id']}  [{q['status']}]  {q['created_at']}")
+    if q["category"]:
+        print(f"category: {q['category']}")
+    if tags:
+        print(f"tags: {', '.join(tags)}")
+    if q["energy_level"]:
+        print(f"energy: {q['energy_level']}/5")
+    if q["parent_id"]:
+        print(f"follow-up of: #{q['parent_id']}")
+    print(f"\nQ: {q['text']}")
+    if q["answer"]:
+        print(f"\nA: {q['answer']}  (answered {q['answered_at']})")
+    if children:
+        print("\nfollow-ups:")
+        for c in children:
+            print(f"  #{c['id']}  {c['text'][:70]}")
+
+
+def cmd_chain(args):
+    con = connect()
+    rows = con.execute("""
+        WITH RECURSIVE up(id, parent_id, depth) AS (
+            SELECT id, parent_id, 0 FROM questions WHERE id = ?
+            UNION ALL
+            SELECT q.id, q.parent_id, u.depth + 1 FROM questions q JOIN up u ON q.id = u.parent_id
+        ),
+        root AS (SELECT id FROM up ORDER BY depth DESC LIMIT 1),
+        down(id, depth) AS (
+            SELECT id, 0 FROM root
+            UNION ALL
+            SELECT q.id, d.depth + 1 FROM questions q JOIN down d ON q.parent_id = d.id
+        )
+        SELECT q.id, d.depth, q.status, q.text FROM down d JOIN questions q ON q.id = d.id
+        ORDER BY d.depth
+    """, (args.id,)).fetchall()
+    for r in rows:
+        print(f"{'  ' * r['depth']}#{r['id']} [{r['status']}] {r['text'][:80]}")
+
+
+def cmd_search(args):
+    con = connect()
+    rows = con.execute("""
+        SELECT q.id, q.created_at, q.status, q.text
+        FROM questions_fts f JOIN questions q ON q.id = f.rowid
+        WHERE questions_fts MATCH ? ORDER BY rank LIMIT ?
+    """, (args.query, args.limit)).fetchall()
+    print_table(["id", "created_at", "status", "text"],
+                [[r["id"], r["created_at"], r["status"], r["text"][:70]] for r in rows])
+
+
+def cmd_categories(args):
+    con = connect()
+    print_table(["name", "n"], [[r["name"], r["n"]] for r in con.execute("SELECT * FROM v_category_freq")])
+
+
+def cmd_tags(args):
+    con = connect()
+    print_table(["name", "n"], [[r["name"], r["n"]] for r in con.execute("SELECT * FROM v_tag_freq")])
+
+
+def cmd_sql(args):
+    con = connect()
+    cur = con.execute(args.query)
+    rows = cur.fetchall()
+    if cur.description:
+        headers = [d[0] for d in cur.description]
+        print_table(headers, [list(r) for r in rows])
+    con.commit()
+
+
+def cmd_shell(args):
+    os.execvp("sqlite3", ["sqlite3", DB_PATH])
+
+
+def cmd_stats(args):
+    con = connect()
+    total = con.execute("SELECT count(*) AS n FROM questions").fetchone()["n"]
+    print(f"=== questbox stats ({total} questions total) ===\n")
+
+    print("-- status breakdown --")
+    print_table(["status", "n"], [[r["status"], r["n"]] for r in con.execute("SELECT * FROM v_status_breakdown")])
+
+    print("\n-- by category --")
+    print_table(["category", "n"], [[r["name"], r["n"]] for r in con.execute("SELECT * FROM v_category_freq")])
+
+    print("\n-- top tags --")
+    print_table(["tag", "n"], [[r["name"], r["n"]] for r in con.execute("SELECT * FROM v_tag_freq LIMIT 15")])
+
+    print("\n-- tag co-occurrence (top 10) --")
+    print_table(["tag_a", "tag_b", "n"],
+                [[r["tag_a"], r["tag_b"], r["n"]] for r in con.execute("SELECT * FROM v_tag_cooccurrence LIMIT 10")])
+
+    print("\n-- questions by hour of day --")
+    print_table(["hour", "n"], [[r["hour"], r["n"]] for r in con.execute("SELECT * FROM v_hourly_pattern")])
+
+    print("\n-- questions by weekday --")
+    print_table(["weekday", "n"], [[r["weekday"], r["n"]] for r in con.execute("SELECT * FROM v_weekday_pattern")])
+
+    print("\n-- burst sessions (3+ questions in one sitting) --")
+    print_table(["session_id", "n", "start", "end", "span_min"],
+                [[r["session_id"], r["n"], r["start"], r["end"], r["span_minutes"]]
+                 for r in con.execute("SELECT * FROM v_bursts LIMIT 10")])
+
+    print("\n-- longest follow-up chains --")
+    print_table(["root_id", "chain_size"],
+                [[r["root_id"], r["chain_size"]] for r in con.execute("SELECT * FROM v_chain_sizes LIMIT 10")])
+
+    print("\n-- avg energy by category --")
+    print_table(["category", "avg_energy", "n"],
+                [[r["name"], r["avg_energy"], r["n"]] for r in con.execute("SELECT * FROM v_avg_energy_by_category")])
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="qb", description="questbox: file and mine your own questions")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", help="create the database")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("add", help="file a new question")
+    s.add_argument("text")
+    s.add_argument("--category", "-c")
+    s.add_argument("--tags", "-t", help="comma-separated")
+    s.add_argument("--energy", "-e", type=int, choices=range(1, 6))
+    s.add_argument("--parent", "-p", type=int, help="id of question this follows up on")
+    s.add_argument("--session-gap", type=int, default=DEFAULT_SESSION_GAP_MIN,
+                   help="minutes of inactivity that starts a new session (default 20)")
+    s.add_argument("--no-session", action="store_true")
+    s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("answer", help="answer a question")
+    s.add_argument("id", type=int)
+    s.add_argument("text")
+    s.set_defaults(func=cmd_answer)
+
+    s = sub.add_parser("status", help="set status: open/exploring/answered/abandoned")
+    s.add_argument("id", type=int)
+    s.add_argument("status", choices=["open", "exploring", "answered", "abandoned"])
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("tag", help="add tags to a question")
+    s.add_argument("id", type=int)
+    s.add_argument("tags", help="comma-separated")
+    s.set_defaults(func=cmd_tag)
+
+    s = sub.add_parser("untag", help="remove tags from a question")
+    s.add_argument("id", type=int)
+    s.add_argument("tags", help="comma-separated")
+    s.set_defaults(func=cmd_untag)
+
+    s = sub.add_parser("link", help="mark a question as a follow-up of another")
+    s.add_argument("child_id", type=int)
+    s.add_argument("parent_id", type=int)
+    s.set_defaults(func=cmd_link)
+
+    s = sub.add_parser("list", help="list questions")
+    s.add_argument("--status")
+    s.add_argument("--category")
+    s.add_argument("--tag")
+    s.add_argument("--today", action="store_true")
+    s.add_argument("--since", help="YYYY-MM-DD")
+    s.add_argument("--limit", type=int, default=30)
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("show", help="show one question in full, with its follow-ups")
+    s.add_argument("id", type=int)
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("chain", help="show the full follow-up thread a question belongs to")
+    s.add_argument("id", type=int)
+    s.set_defaults(func=cmd_chain)
+
+    s = sub.add_parser("search", help="full-text search questions/answers")
+    s.add_argument("query")
+    s.add_argument("--limit", type=int, default=20)
+    s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("categories", help="list categories with counts")
+    s.set_defaults(func=cmd_categories)
+
+    s = sub.add_parser("tags", help="list tags with counts")
+    s.set_defaults(func=cmd_tags)
+
+    s = sub.add_parser("sql", help="run raw SQL against the db and print results")
+    s.add_argument("query")
+    s.set_defaults(func=cmd_sql)
+
+    s = sub.add_parser("shell", help="drop into the sqlite3 shell on this db")
+    s.set_defaults(func=cmd_shell)
+
+    s = sub.add_parser("stats", help="scope-and-flow report")
+    s.set_defaults(func=cmd_stats)
+
+    return p
+
+
+if __name__ == "__main__":
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)

@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""
+kloud-vpn -- generate and manage a self-hosted WireGuard tunnel by hand.
+
+No account, no coordination server, no company in the loop: this shells
+out to `wg` (from wireguard-tools -- itself just an open-source CLI, not
+a service) to generate keys, and writes a standard wg-quick config file
+you install yourself on each machine. Two machines, each holding the
+other's public key, that's the whole trust model.
+"""
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+WG_DIR = HERE / ".kloud" / "wg"
+SELF_PATH = WG_DIR / "self.json"
+PEERS_PATH = WG_DIR / "peers.json"
+
+INSTALL_HINT = (
+    "  macOS:         brew install wireguard-tools\n"
+    "  Debian/Ubuntu: sudo apt install wireguard\n"
+    "  Arch:          sudo pacman -S wireguard-tools\n"
+)
+
+
+def require_wg():
+    if not shutil.which("wg"):
+        sys.exit("`wg` not found. Install wireguard-tools first:\n" + INSTALL_HINT)
+
+
+def cmd_doctor(args):
+    if shutil.which("wg"):
+        out = subprocess.run(["wg", "--version"], capture_output=True, text=True).stdout.strip()
+        print(f"[ok] wg found: {out}")
+    else:
+        print("[missing] wg not found. Install it:")
+        print(INSTALL_HINT)
+
+
+def load_peers():
+    if PEERS_PATH.exists():
+        return json.loads(PEERS_PATH.read_text())
+    return []
+
+
+def save_peers(peers):
+    WG_DIR.mkdir(parents=True, exist_ok=True)
+    PEERS_PATH.write_text(json.dumps(peers, indent=2))
+
+
+def cmd_init(args):
+    require_wg()
+    WG_DIR.mkdir(parents=True, exist_ok=True)
+    priv = subprocess.run(["wg", "genkey"], capture_output=True, text=True, check=True).stdout.strip()
+    pub = subprocess.run(["wg", "pubkey"], input=priv, capture_output=True, text=True, check=True).stdout.strip()
+    key_path = WG_DIR / f"{args.name}.key"
+    key_path.write_text(priv + "\n")
+    key_path.chmod(0o600)
+    self_cfg = {
+        "name": args.name,
+        "address": args.address,
+        "listen_port": args.listen_port,
+        "pubkey": pub,
+        "key_path": str(key_path),
+    }
+    SELF_PATH.write_text(json.dumps(self_cfg, indent=2))
+    print(f"This machine's WireGuard identity ('{args.name}'):")
+    print(f"  address:    {args.address}")
+    print(f"  public key: {pub}")
+    print()
+    print("Send the address + public key above to whoever runs the other")
+    print("machine, through any channel you trust -- they'll need it for")
+    print("`kloud-vpn peer add` on their side. The private key never leaves")
+    print(f"this machine ({key_path}).")
+
+
+def cmd_peer_add(args):
+    peers = [p for p in load_peers() if p["name"] != args.name]
+    peers.append({
+        "name": args.name,
+        "pubkey": args.pubkey,
+        "endpoint": args.endpoint,
+        "allowed_ips": args.allowed_ips,
+    })
+    save_peers(peers)
+    print(f"Added/updated peer '{args.name}'. Run `kloud-vpn config` to regenerate wg0.conf.")
+
+
+def cmd_peer_list(args):
+    peers = load_peers()
+    if not peers:
+        print("(no peers yet -- `kloud-vpn peer add`)")
+        return
+    for p in peers:
+        print(f"{p['name']:12} endpoint={p['endpoint']:24} allowed_ips={p['allowed_ips']}")
+
+
+def cmd_config(args):
+    if not SELF_PATH.exists():
+        sys.exit("Run `kloud-vpn init` first.")
+    self_cfg = json.loads(SELF_PATH.read_text())
+    priv = Path(self_cfg["key_path"]).read_text().strip()
+    peers = load_peers()
+    if not peers:
+        sys.exit("No peers configured yet -- `kloud-vpn peer add` first.")
+    lines = [
+        "[Interface]",
+        f"PrivateKey = {priv}",
+        f"Address = {self_cfg['address']}",
+        f"ListenPort = {self_cfg['listen_port']}",
+        "",
+    ]
+    for p in peers:
+        lines += [
+            f"# peer: {p['name']}",
+            "[Peer]",
+            f"PublicKey = {p['pubkey']}",
+            f"Endpoint = {p['endpoint']}",
+            f"AllowedIPs = {p['allowed_ips']}",
+            "PersistentKeepalive = 25",
+            "",
+        ]
+    out_path = WG_DIR / "wg0.conf"
+    out_path.write_text("\n".join(lines))
+    out_path.chmod(0o600)
+    print(f"Wrote {out_path}")
+    print()
+    print("This file contains your private key -- never commit it, never send it.")
+    print("Install it on THIS machine only:")
+    print(f"  macOS (CLI):  sudo wg-quick up {out_path}")
+    print(f"  macOS (app):  WireGuard app -> Import tunnel(s) from file -> {out_path}")
+    print(f"  Linux:        sudo cp {out_path} /etc/wireguard/wg0.conf && sudo wg-quick up wg0")
+
+
+def cmd_status(args):
+    if not shutil.which("wg"):
+        print("wg not installed -- nothing to show.")
+        return
+    subprocess.run(["wg", "show"])
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="kloud-vpn", description="Self-hosted WireGuard tunnel. No third party.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_doctor = sub.add_parser("doctor", help="check whether wireguard-tools is installed")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_init = sub.add_parser("init", help="generate this machine's WireGuard identity")
+    p_init.add_argument("--name", required=True, help="a name for this machine, e.g. mac")
+    p_init.add_argument("--address", required=True, help="this machine's VPN IP, e.g. 10.66.0.1/24")
+    p_init.add_argument("--listen-port", type=int, default=51820)
+    p_init.set_defaults(func=cmd_init)
+
+    p_peer = sub.add_parser("peer", help="manage peers")
+    peer_sub = p_peer.add_subparsers(dest="peer_cmd", required=True)
+    p_peer_add = peer_sub.add_parser("add", help="add or update a peer")
+    p_peer_add.add_argument("--name", required=True)
+    p_peer_add.add_argument("--pubkey", required=True)
+    p_peer_add.add_argument("--endpoint", required=True, help="host:port the peer is reachable at")
+    p_peer_add.add_argument("--allowed-ips", required=True, help="peer's VPN IP, e.g. 10.66.0.2/32")
+    p_peer_add.set_defaults(func=cmd_peer_add)
+    p_peer_list = peer_sub.add_parser("list", help="list configured peers")
+    p_peer_list.set_defaults(func=cmd_peer_list)
+
+    p_config = sub.add_parser("config", help="render the wg-quick config file from self + peers")
+    p_config.set_defaults(func=cmd_config)
+
+    p_status = sub.add_parser("status", help="show live tunnel status (wg show)")
+    p_status.set_defaults(func=cmd_status)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

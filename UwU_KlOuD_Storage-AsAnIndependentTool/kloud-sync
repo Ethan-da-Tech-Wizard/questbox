@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""
+kloud-sync -- two-way delta sync between this machine's kloud storage and
+another machine's, over plain rsync+ssh (both standard system tools,
+already on your machine, not a hosted service). Meant to run over the
+kloud-vpn tunnel so the connection stays private.
+
+Not true conflict resolution -- it's two `rsync --update` passes, so
+whichever side has the newer file wins. Fine for one person working from
+one machine at a time; if both machines edit the same file in the same
+window, the older edit is what gets overwritten.
+"""
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+KLOUD_CONFIG = HERE / ".kloud" / "config.json"
+SYNC_CONFIG = HERE / ".kloud" / "sync.json"
+
+
+def local_root():
+    if not KLOUD_CONFIG.exists():
+        sys.exit("kloud isn't set up on this machine yet -- run `kloud init` first.")
+    return json.loads(KLOUD_CONFIG.read_text())["root"]
+
+
+def load_sync_config():
+    if not SYNC_CONFIG.exists():
+        sys.exit("Not set up yet -- run `kloud-sync setup` first.")
+    return json.loads(SYNC_CONFIG.read_text())
+
+
+def cmd_setup(args):
+    cfg = {
+        "peer_host": args.peer_host,
+        "peer_user": args.peer_user,
+        "peer_root": args.peer_root,
+        "last_sync": None,
+    }
+    SYNC_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    SYNC_CONFIG.write_text(json.dumps(cfg, indent=2))
+    print(f"Will sync with {args.peer_user}@{args.peer_host}:{args.peer_root}")
+    print("Set up the matching config (with hosts swapped) on the other machine too.")
+
+
+def _rsync(src, dst):
+    return subprocess.run(
+        ["rsync", "-az", "--update", "-e", "ssh -o ConnectTimeout=8 -o BatchMode=yes", src, dst],
+        capture_output=True, text=True,
+    )
+
+
+def cmd_now(args):
+    root = local_root()
+    if not root.endswith("/"):
+        root += "/"
+    cfg = load_sync_config()
+    peer_root = cfg["peer_root"] if cfg["peer_root"].endswith("/") else cfg["peer_root"] + "/"
+    peer = f"{cfg['peer_user']}@{cfg['peer_host']}:{peer_root}"
+
+    print(f"Pushing local changes to {cfg['peer_host']}...")
+    r1 = _rsync(root, peer)
+    if r1.returncode != 0:
+        sys.exit(
+            f"Couldn't reach {cfg['peer_host']}. Check that its VPN tunnel is up, "
+            f"it's actually turned on, and kloud-sync is set up there too.\n\n"
+            f"{r1.stderr.strip()}"
+        )
+
+    print(f"Pulling their changes from {cfg['peer_host']}...")
+    r2 = _rsync(peer, root)
+    if r2.returncode != 0:
+        sys.exit(f"Push worked but pulling their changes back failed:\n\n{r2.stderr.strip()}")
+
+    cfg["last_sync"] = datetime.now(timezone.utc).isoformat()
+    SYNC_CONFIG.write_text(json.dumps(cfg, indent=2))
+    print("Sync complete -- both machines now have the same files.")
+
+
+def cmd_status(args):
+    if not SYNC_CONFIG.exists():
+        print("Not set up yet -- run `kloud-sync setup` first.")
+        return
+    cfg = json.loads(SYNC_CONFIG.read_text())
+    print(f"peer: {cfg['peer_user']}@{cfg['peer_host']}:{cfg['peer_root']}")
+    print(f"last sync: {cfg['last_sync'] or 'never yet'}")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="kloud-sync", description="Two-way rsync between two kloud machines.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_setup = sub.add_parser("setup", help="point this machine at its sync partner")
+    p_setup.add_argument("--peer-host", required=True, help="the other machine's address, e.g. its VPN IP")
+    p_setup.add_argument("--peer-user", required=True, help="username to log into it over ssh")
+    p_setup.add_argument("--peer-root", required=True, help="its kloud storage folder path")
+    p_setup.set_defaults(func=cmd_setup)
+
+    p_now = sub.add_parser("now", help="sync with the peer right now")
+    p_now.set_defaults(func=cmd_now)
+
+    p_status = sub.add_parser("status", help="show sync partner + last sync time")
+    p_status.set_defaults(func=cmd_status)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

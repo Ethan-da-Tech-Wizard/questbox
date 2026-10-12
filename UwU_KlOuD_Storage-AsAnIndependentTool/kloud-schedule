@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""
+kloud-schedule -- turns this machine's kloud server (and a sync pass) on
+and off on a daily time window, so it isn't running 24/7. Driven by cron
+(standard on macOS/Linux, not a service) calling `kloud-schedule run`
+every few minutes.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, time as dtime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCHEDULE_CONFIG = HERE / ".kloud" / "schedule.json"
+STATE_PATH = HERE / ".kloud" / "state.json"
+SYNC_CONFIG = HERE / ".kloud" / "sync.json"
+KLOUD = HERE / "kloud"
+SYNC = HERE / "kloud-sync"
+CRON_MARKER = "# kloud-schedule (questbox)"
+
+
+def _parse_hhmm(s):
+    h, m = s.split(":")
+    return dtime(int(h), int(m))
+
+
+def cmd_set(args):
+    _parse_hhmm(args.start)
+    _parse_hhmm(args.end)
+    SCHEDULE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    SCHEDULE_CONFIG.write_text(json.dumps({"start": args.start, "end": args.end, "enabled": True}, indent=2))
+    print(f"This machine will be live from {args.start} to {args.end} every day.")
+
+
+def _in_window(now_t, start_t, end_t):
+    if start_t <= end_t:
+        return start_t <= now_t < end_t
+    return now_t >= start_t or now_t < end_t  # window wraps past midnight
+
+
+def load_schedule():
+    if not SCHEDULE_CONFIG.exists():
+        return None
+    return json.loads(SCHEDULE_CONFIG.read_text())
+
+
+def cmd_status(args):
+    sched = load_schedule()
+    if not sched:
+        print("No schedule set -- `kloud-schedule set --start HH:MM --end HH:MM`.")
+        return
+    now_t = datetime.now().time()
+    inside = _in_window(now_t, _parse_hhmm(sched["start"]), _parse_hhmm(sched["end"]))
+    print(f"Window: {sched['start']} - {sched['end']} daily")
+    print(f"Enabled: {sched.get('enabled', True)}")
+    print(f"Right now: {'inside window (should be live)' if inside else 'outside window (should be off)'}")
+
+
+def _is_running():
+    if not STATE_PATH.exists():
+        return False
+    try:
+        pid = json.loads(STATE_PATH.read_text()).get("pid")
+    except Exception:
+        return False
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def cmd_run(args):
+    sched = load_schedule()
+    if not sched or not sched.get("enabled", True):
+        return
+    now_t = datetime.now().time()
+    inside = _in_window(now_t, _parse_hhmm(sched["start"]), _parse_hhmm(sched["end"]))
+    running = _is_running()
+    have_sync_partner = SYNC.exists() and SYNC_CONFIG.exists()
+
+    if inside:
+        if not running:
+            subprocess.run([str(KLOUD), "start"])
+        if have_sync_partner:
+            subprocess.run([str(SYNC), "now"])
+    else:
+        if running:
+            if have_sync_partner:
+                subprocess.run([str(SYNC), "now"])
+            subprocess.run([str(KLOUD), "stop"])
+
+
+def _current_crontab():
+    """Returns the existing crontab text, or None if `crontab` isn't available at all."""
+    try:
+        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    return r.stdout if r.returncode == 0 else ""
+
+
+def cmd_install(args):
+    existing = _current_crontab()
+    if existing is None:
+        sys.exit(
+            "`cron` isn't available on this machine, so this can't run automatically.\n"
+            f"You can still run `{KLOUD_SCHEDULE_HINT()} run` by hand whenever you want a check."
+        )
+    lines = [l for l in existing.splitlines() if CRON_MARKER not in l]
+    lines.append(f"*/{args.interval_minutes} * * * * {sys.executable} {HERE / 'kloud-schedule'} run {CRON_MARKER}")
+    new_crontab = "\n".join(lines) + "\n"
+    r = subprocess.run(["crontab", "-"], input=new_crontab, text=True)
+    if r.returncode != 0:
+        sys.exit("Couldn't install the cron job.")
+    print(f"Installed. This machine will check every {args.interval_minutes} minutes whether it should be on.")
+
+
+def cmd_uninstall(args):
+    existing = _current_crontab()
+    if existing is None:
+        print("`cron` isn't available on this machine -- nothing to remove.")
+        return
+    lines = [l for l in existing.splitlines() if CRON_MARKER not in l]
+    new_crontab = "\n".join(lines) + ("\n" if lines else "")
+    r = subprocess.run(["crontab", "-"], input=new_crontab, text=True)
+    if r.returncode != 0:
+        sys.exit("Couldn't update crontab.")
+    print("Removed the automatic schedule. Whatever on/off state it's in now, it'll stay in.")
+
+
+def KLOUD_SCHEDULE_HINT():
+    return str(HERE / "kloud-schedule")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="kloud-schedule", description="Rotate this machine's kloud server on a daily window.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_set = sub.add_parser("set", help="set the daily on/off window")
+    p_set.add_argument("--start", required=True, help="24h HH:MM, e.g. 21:00")
+    p_set.add_argument("--end", required=True, help="24h HH:MM, e.g. 07:00")
+    p_set.set_defaults(func=cmd_set)
+
+    p_status = sub.add_parser("status", help="show the window and whether we're in it right now")
+    p_status.set_defaults(func=cmd_status)
+
+    p_run = sub.add_parser("run", help="the tick: start/stop/sync based on the current time (call from cron)")
+    p_run.set_defaults(func=cmd_run)
+
+    p_install = sub.add_parser("install", help="install a cron job that calls `run` periodically")
+    p_install.add_argument("--interval-minutes", type=int, default=5)
+    p_install.set_defaults(func=cmd_install)
+
+    p_uninstall = sub.add_parser("uninstall", help="remove the cron job")
+    p_uninstall.set_defaults(func=cmd_uninstall)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
