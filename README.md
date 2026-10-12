@@ -1,23 +1,32 @@
-# questbox
+# Questbox
 
-A toolbox of niche, self-built tools. Everything in here is meant to be
-fully yours: no third-party services, no telemetry, no accounts, free to
-run forever — hand-built on open protocols, not wrapped around someone
-else's platform.
+Small self-hosted tools for tracking questions, serving personal storage, synchronizing drives, and scheduling access.
 
-## Tools
+**Status:** Command-line toolbox  
+**Built with:** Python standard library, SQLite, WireGuard helpers
 
-- [`question-tracker/`](question-tracker/README.md) — a personal
-  question-tracking database (`qb`). File every question you ask with a
-  timestamp, category, tags, and energy rating; query the shape of your
-  own thinking with real SQL.
-- [`UwU_KlOuD_Storage-AsAnIndependentTool/`](UwU_KlOuD_Storage-AsAnIndependentTool/README.md)
-  (`kloud`) — self-hosted cloud storage with a guided menu. Point it at
-  an external drive, serve it over your own network with a token only
-  you hold, connect a second machine over a self-hosted WireGuard VPN,
-  keep both drives in sync, and set a daily on/off schedule so nothing
-  has to run 24/7.
+[Project guide](docs/PROJECT_GUIDE.md) · [Every file explained](docs/FILE_GUIDE.md) · [Licenses and dependencies](docs/LICENSE_REVIEW.md)
 
-Each tool is self-contained in its own folder with its own README. The
-shared rule across all of them: Python 3 stdlib only, no dependencies, no
-data leaving your own machines unless you explicitly send it somewhere.
+## Start here
+
+- [PROJECT_NOTES.md](PROJECT_NOTES.md) — Preserved detailed setup, usage, architecture, and development notes from the earlier README.
+- [question-tracker/README.md](question-tracker/README.md) — Documentation: questbox. Covers Setup; Day to day; Making sense of it.
+- [UwU_KlOuD_Storage-AsAnIndependentTool/README.md](UwU_KlOuD_Storage-AsAnIndependentTool/README.md) — Documentation: kloud. Covers Start here: the menu; 1. Storage — `kloud`; A note on dual-band / self-switching WiFi.
+
+[Detailed setup, usage, and development notes](PROJECT_NOTES.md) preserve the previous project documentation.
+
+## Repository layout
+
+| Path | Role |
+| --- | --- |
+| [UwU_KlOuD_Storage-AsAnIndependentTool/](UwU_KlOuD_Storage-AsAnIndependentTool/) | Project-specific UwU KlOuD Storage-AsAnIndependentTool components (5 tracked entries). |
+| [docs/](docs/) | Project documentation, decisions, and reference material (5 tracked entries). |
+| [question-tracker/](question-tracker/) | Project-specific question-tracker components (3 tracked entries). |
+
+## Scope and current limits
+
+The question database, storage contents, and generated access tokens belong in local runtime storage, not in Git.
+
+## License
+
+Original project code retains **MIT** terms in [LICENSE](LICENSE). Third-party libraries, media, data, models, and tools retain their own terms. See the [license review](docs/LICENSE_REVIEW.md) and [dependency inventory](docs/DEPENDENCIES.csv).
