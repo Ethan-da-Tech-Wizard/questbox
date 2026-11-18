@@ -1,3 +1,10 @@
+<!-- ==============================================================================
+# Program: README.md
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: User manual, CLI reference, and schema documentation for the SQLite-backed questbox inquiry tracker.
+============================================================================== -->
+
 # questbox
 
 A personal question-tracking database. Every question you fire off gets

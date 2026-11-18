@@ -1,3 +1,10 @@
+<!-- ==============================================================================
+# Program: LICENSE_REVIEW.md
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: License compliance verification covering the original project codebase and external dependencies.
+============================================================================== -->
+
 # License review — Questbox
 
 Reviewed 2026-10-12. Original project code retains **MIT** terms in [LICENSE](../LICENSE).

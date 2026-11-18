@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ==============================================================================
+# Program: kloud-sync
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Bidirectional delta synchronization utility between peer kloud nodes.
+#          Leverages rsync over SSH through an encrypted WireGuard tunnel,
+#          resolving updates by file modification timestamps.
+# ==============================================================================
 """
 kloud-sync -- two-way delta sync between this machine's kloud storage and
 another machine's, over plain rsync+ssh (both standard system tools,
@@ -34,6 +42,7 @@ def load_sync_config():
     return json.loads(SYNC_CONFIG.read_text())
 
 
+# Step 1: Configure remote peer connection endpoint and sync targets
 def cmd_setup(args):
     cfg = {
         "peer_host": args.peer_host,
@@ -54,6 +63,7 @@ def _rsync(src, dst):
     )
 
 
+# Step 2: Execute bidirectional rsync pass with timestamp-based conflict resolution
 def cmd_now(args):
     root = local_root()
     if not root.endswith("/"):
@@ -81,6 +91,7 @@ def cmd_now(args):
     print("Sync complete -- both machines now have the same files.")
 
 
+# Step 3: Report last synchronization timestamp and peer health status
 def cmd_status(args):
     if not SYNC_CONFIG.exists():
         print("Not set up yet -- run `kloud-sync setup` first.")

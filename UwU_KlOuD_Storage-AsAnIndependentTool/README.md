@@ -1,3 +1,10 @@
+<!-- ==============================================================================
+# Program: README.md
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Technical architecture, operational guide, and security model for the self-hosted kloud storage and synchronization suite.
+============================================================================== -->
+
 # kloud
 
 A cloud drive you actually own. Four small Python files, stdlib only, no

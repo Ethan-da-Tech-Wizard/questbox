@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ==============================================================================
+# Program: kloud
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Zero-dependency self-hosted file store using Python 3 stdlib HTTP server.
+#          Implements bearer-token authentication, secure streaming file transfers,
+#          hash verification, and local daemon lifecycle management.
+# ==============================================================================
 """
 kloud -- a self-hosted, zero-dependency file store.
 
@@ -36,6 +44,7 @@ SYNC_SCRIPT = HERE / "kloud-sync"
 SCHEDULE_SCRIPT = HERE / "kloud-schedule"
 
 
+# Step 1: Read server configuration and bearer token salt from local state
 def load_config():
     if not CONFIG_PATH.exists():
         sys.exit("No config found. Run `kloud init --root /path/to/drive` first.")
@@ -103,6 +112,7 @@ def bonjour_host():
     return None
 
 
+# Step 2: Probe TCP socket availability to verify active server listener
 def _reachable_at(scheme, port):
     host = bonjour_host()
     if host:
@@ -114,6 +124,7 @@ def _reachable_at(scheme, port):
     return f"Reach it at: {scheme}://{lan_ip()}:{port}/  (from another device on this network, or over the VPN)"
 
 
+# Step 3: Spawn background daemon process and record PID into state file
 def cmd_start(args):
     if not CONFIG_PATH.exists():
         sys.exit("Not set up yet -- run the guided setup first (menu option 1, or `kloud init --root ...`).")
@@ -141,6 +152,7 @@ def cmd_start(args):
     print(_reachable_at(scheme, port))
 
 
+# Step 4: Terminate active background daemon using standard POSIX signals
 def cmd_stop(args):
     running, pid, _ = _running_info()
     if not running:
@@ -658,6 +670,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
+# Step 5: Initialize HTTP/HTTPS server request handler loop with SSL context
 def cmd_serve(args):
     cfg = load_config()
     Handler.cfg = cfg

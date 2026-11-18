@@ -1,3 +1,12 @@
+-- ==============================================================================
+-- Program: schema.sql
+-- Programmer: Ethan-da-Tech-Wizard
+-- Last Modified: November 18, 2026
+-- Purpose: SQLite relational database schema definition for the questbox engine.
+--          Defines tables, relationships, and constraints for sessions, categories,
+--          tags, questions, full-text indexing, and analytical recursive views.
+-- ==============================================================================
+
 -- questbox schema
 -- A personal question-tracking database: every question you fire off gets
 -- filed here with enough metadata to later mine for patterns (scope, flow,

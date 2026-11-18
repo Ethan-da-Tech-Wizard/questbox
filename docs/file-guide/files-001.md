@@ -1,3 +1,10 @@
+<!-- ==============================================================================
+# Program: files-001.md
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Comprehensive file inventory detailing file sizes, status, and responsibilities across submodules.
+============================================================================== -->
+
 # Files 1 of 1 — Questbox
 
 [All pages](../FILE_GUIDE.md) · [Project guide](../PROJECT_GUIDE.md)

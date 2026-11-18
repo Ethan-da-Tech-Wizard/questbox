@@ -1,3 +1,10 @@
+<!-- ==============================================================================
+# Program: README.md
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Root entry point and architectural overview for questbox, housing local question tracking and independent cloud storage tools.
+============================================================================== -->
+
 # Questbox
 
 Small self-hosted tools for tracking questions, serving personal storage, synchronizing drives, and scheduling access.

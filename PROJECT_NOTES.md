@@ -1,3 +1,10 @@
+<!-- ==============================================================================
+# Program: PROJECT_NOTES.md
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Preserves foundational technical documentation, development history, design decisions, and system architecture notes.
+============================================================================== -->
+
 # questbox
 
 A toolbox of niche, self-built tools. Everything in here is meant to be

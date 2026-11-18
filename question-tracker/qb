@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ==============================================================================
+# Program: qb
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Personal question-tracking CLI backed by SQLite. Enables structured
+#          recording of investigative queries, contextual metadata, follow-up chains,
+#          session burst clustering, and analytical SQL introspection.
+# ==============================================================================
 """
 questbox (qb) -- a personal question-tracking CLI backed by SQLite.
 
@@ -17,6 +25,7 @@ SCHEMA_PATH = os.path.join(HERE, "schema.sql")
 DEFAULT_SESSION_GAP_MIN = 20  # questions within this many minutes = same burst
 
 
+# Step 1: Establish verified SQLite database connection with active foreign key constraints
 def connect():
     if not os.path.exists(DB_PATH):
         sys.exit(f"No database at {DB_PATH}. Run `qb init` first.")
@@ -30,6 +39,7 @@ def now_str():
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
+# Step 2: Format tabular output dynamically aligning columns to maximum character width
 def print_table(headers, rows):
     if not rows:
         print("(no rows)")
@@ -44,6 +54,7 @@ def print_table(headers, rows):
         print(fmt(r))
 
 
+# Helper: Retrieve existing entity identifier or insert a new record atomically
 def get_or_create(con, table, name):
     if name is None:
         return None
@@ -55,6 +66,7 @@ def get_or_create(con, table, name):
     return cur.lastrowid
 
 
+# Logic: Cluster questions asked within temporal window into unified inquiry session
 def resolve_session(con, gap_minutes):
     """Reuse the most recent session if the last question was asked within
     gap_minutes; otherwise start a new one. This is what auto-detects bursts."""
@@ -72,6 +84,7 @@ def resolve_session(con, gap_minutes):
 
 # ---------------------------------------------------------------- commands
 
+# Command Handler: Initialize database schema with tables, indexes, views, and FTS5 triggers
 def cmd_init(args):
     if os.path.exists(DB_PATH) and not args.force:
         sys.exit(f"{DB_PATH} already exists. Pass --force to reapply schema (safe: uses IF NOT EXISTS).")
@@ -83,6 +96,7 @@ def cmd_init(args):
     print(f"Initialized {DB_PATH}")
 
 
+# Command Handler: Insert new question with category resolution, tag linking, and session assignment
 def cmd_add(args):
     con = connect()
     category_id = get_or_create(con, "categories", args.category) if args.category else None
@@ -101,6 +115,7 @@ def cmd_add(args):
     print(f"#{qid} filed.")
 
 
+# Command Handler: Record answer text, transition status, and timestamp resolution
 def cmd_answer(args):
     con = connect()
     con.execute(
@@ -138,6 +153,7 @@ def cmd_untag(args):
     print(f"#{args.id} untagged: {args.tags}")
 
 
+# Command Handler: Establish directed parental relationship between question nodes
 def cmd_link(args):
     con = connect()
     con.execute("UPDATE questions SET parent_id = ? WHERE id = ?", (args.parent_id, args.child_id))
@@ -145,6 +161,7 @@ def cmd_link(args):
     print(f"#{args.child_id} linked as follow-up of #{args.parent_id}")
 
 
+# Command Handler: Query and filter question collection by status, category, tag, or time
 def cmd_list(args):
     con = connect()
     clauses, params = [], []
@@ -197,6 +214,7 @@ def cmd_show(args):
             print(f"  #{c['id']}  {c['text'][:70]}")
 
 
+# Command Handler: Trace recursive ancestor-descendant graph for a given inquiry node
 def cmd_chain(args):
     con = connect()
     rows = con.execute("""
@@ -218,6 +236,7 @@ def cmd_chain(args):
         print(f"{'  ' * r['depth']}#{r['id']} [{r['status']}] {r['text'][:80]}")
 
 
+# Command Handler: Execute full-text BM25 search across question text and resolved answers
 def cmd_search(args):
     con = connect()
     rows = con.execute("""
@@ -253,6 +272,7 @@ def cmd_shell(args):
     os.execvp("sqlite3", ["sqlite3", DB_PATH])
 
 
+# Command Handler: Synthesize aggregate metrics on energy, burst cadence, and resolution rate
 def cmd_stats(args):
     con = connect()
     total = con.execute("SELECT count(*) AS n FROM questions").fetchone()["n"]
