@@ -12,6 +12,18 @@ and off on a daily time window, so it isn't running 24/7. Driven by cron
 (standard on macOS/Linux, not a service) calling `kloud-schedule run`
 every few minutes.
 """
+
+# Fit: part of the kloud family (see the architecture note in `kloud`). `kloud` (menu option 6) calls
+# `set` and `install` here; once installed, cron runs `kloud-schedule run` every few minutes, and that tick
+# starts or stops the kloud server (and runs kloud-sync) depending on the clock.
+#
+# State: .kloud/schedule.json {start, end, enabled}. The server's state file .kloud/state.json is read
+# to learn whether it is running.
+# Behaviour of one tick (cmd_run): inside the window -> make sure the server is on and sync; outside the
+# window -> do a last sync, then stop the server. The tick is idempotent, so running it more often than
+# needed is harmless.
+# Limits: times are the machine's local clock (daylight-saving changes shift the window); invalid
+# HH:MM values raise a ValueError traceback; cron must exist (see cmd_install).
 import argparse
 import json
 import os
@@ -20,22 +32,29 @@ import sys
 from datetime import datetime, time as dtime
 from pathlib import Path
 
+# State lives in .kloud/ next to the script, shared with kloud and kloud-sync.
 HERE = Path(__file__).resolve().parent
 SCHEDULE_CONFIG = HERE / ".kloud" / "schedule.json"
 STATE_PATH = HERE / ".kloud" / "state.json"
 SYNC_CONFIG = HERE / ".kloud" / "sync.json"
 KLOUD = HERE / "kloud"
 SYNC = HERE / "kloud-sync"
+
+# Marker appended to our crontab line. install/uninstall find and replace exactly their own line by this text and never touch the user's other entries.
 CRON_MARKER = "# kloud-schedule (questbox)"
 
 
 def _parse_hhmm(s):
+    """Convert "HH:MM" (24 hour) to a datetime.time. Raises ValueError for a malformed or out-of-range value."""
     h, m = s.split(":")
     return dtime(int(h), int(m))
 
 
-# Step 1: Validate and persist active operational time window for server
 def cmd_set(args):
+    """Validate and save the daily on/off window (args.start, args.end as "HH:MM"), enabled by default.
+
+    Parsing both values first means nothing is written if either is invalid.
+    """
     _parse_hhmm(args.start)
     _parse_hhmm(args.end)
     SCHEDULE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
@@ -44,18 +63,26 @@ def cmd_set(args):
 
 
 def _in_window(now_t, start_t, end_t):
+    """Return True if clock time `now_t` falls inside the daily window [start_t, end_t).
+
+    The window is half-open (start included, end excluded) so there is no double-counted minute. When
+    start is later than end (for example 21:00 to 07:00) the window wraps past midnight and the test
+    becomes "after start OR before end".
+    """
     if start_t <= end_t:
         return start_t <= now_t < end_t
     return now_t >= start_t or now_t < end_t  # window wraps past midnight
 
 
 def load_schedule():
+    """Return the saved schedule dict, or None when no schedule has been set."""
     if not SCHEDULE_CONFIG.exists():
         return None
     return json.loads(SCHEDULE_CONFIG.read_text())
 
 
 def cmd_status(args):
+    """Print the saved window, whether it is enabled, and whether the clock is inside it right now."""
     sched = load_schedule()
     if not sched:
         print("No schedule set -- `kloud-schedule set --start HH:MM --end HH:MM`.")
@@ -68,6 +95,10 @@ def cmd_status(args):
 
 
 def _is_running():
+    """Return True if the kloud server recorded in state.json is alive (pid exists).
+
+    Reads the file directly instead of importing kloud, so this script has no dependency on it. Any read problem counts as "not running".
+    """
     if not STATE_PATH.exists():
         return False
     try:
@@ -83,8 +114,12 @@ def _is_running():
         return False
 
 
-# Step 2: Evaluate current clock against window bounds and trigger start/stop/sync actions
 def cmd_run(args):
+    """One scheduler tick: bring the server and sync into the state the window says they should be in.
+
+    Does nothing when no schedule exists or it is disabled. Sync runs only if a partner is configured
+    (kloud-sync exists and sync.json is present). Output goes to cron's mail/log, so it stays quiet.
+    """
     sched = load_schedule()
     if not sched or not sched.get("enabled", True):
         return
@@ -93,11 +128,15 @@ def cmd_run(args):
     running = _is_running()
     have_sync_partner = SYNC.exists() and SYNC_CONFIG.exists()
 
+    # Inside the window: start if needed, then sync on every tick so changes propagate promptly.
     if inside:
         if not running:
             subprocess.run([str(KLOUD), "start"])
         if have_sync_partner:
             subprocess.run([str(SYNC), "now"])
+
+    # Outside the window: sync one last time before shutting down so the partner has the final changes.
+    # If the server is already off nothing happens, so repeated ticks overnight do no work.
     else:
         if running:
             if have_sync_partner:
@@ -114,8 +153,12 @@ def _current_crontab():
     return r.stdout if r.returncode == 0 else ""
 
 
-# Step 3: Register periodic cron job runner into user crontab
 def cmd_install(args):
+    """Add a cron job that runs `kloud-schedule run` every args.interval_minutes (default 5).
+
+    Any earlier line with our marker is removed first, so installing twice never creates duplicates.
+    Uses sys.executable so cron runs the same Python interpreter that installed it (cron has a minimal PATH).
+    """
     existing = _current_crontab()
     if existing is None:
         sys.exit(
@@ -131,8 +174,11 @@ def cmd_install(args):
     print(f"Installed. This machine will check every {args.interval_minutes} minutes whether it should be on.")
 
 
-# Step 4: Cleanly purge scheduled runner entries from user crontab
 def cmd_uninstall(args):
+    """Remove our cron line (identified by CRON_MARKER) and leave all other crontab entries untouched.
+
+    The server and sync stay in whatever state they are in; this only stops the automatic switching.
+    """
     existing = _current_crontab()
     if existing is None:
         print("`cron` isn't available on this machine -- nothing to remove.")
@@ -146,10 +192,12 @@ def cmd_uninstall(args):
 
 
 def KLOUD_SCHEDULE_HINT():
+    """Return the full path of this script, used in the "run it by hand" message when cron is unavailable."""
     return str(HERE / "kloud-schedule")
 
 
 def main():
+    """Parse arguments and dispatch to the cmd_* function for the chosen sub-command."""
     parser = argparse.ArgumentParser(prog="kloud-schedule", description="Rotate this machine's kloud server on a daily window.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

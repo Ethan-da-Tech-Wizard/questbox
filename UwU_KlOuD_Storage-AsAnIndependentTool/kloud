@@ -17,6 +17,31 @@ a token only you hold. Python 3 stdlib only, same rule as questbox/qb.
 
 See README.md for the multi-node rotation design (phase 2).
 """
+
+# Architecture: kloud is the front-end program of a small family of scripts in this folder.
+#   kloud           (this file) config, token, HTTP(S) file server, background start/stop, menu wizard
+#   kloud-vpn       creates and manages a WireGuard tunnel between machines
+#   kloud-sync      copies files between two kloud folders over ssh/rsync
+#   kloud-schedule  turns the server and sync on and off at set hours
+# The wizards in this file do not duplicate that work; they ask questions and run the other scripts
+# as subprocesses (VPN_SCRIPT, SYNC_SCRIPT, SCHEDULE_SCRIPT below).
+#
+# Files kept in .kloud/ next to this script (keep it out of git; `kloud safety` checks that):
+#   config.json  storage root, salted token hash, TLS on/off and cert paths (mode 600)
+#   state.json   pid and port of the background server, so stop/status can find it
+#   server.log   output of the background server
+#   cert.pem, key.pem   self-signed certificate (only when TLS was chosen)
+#   wg/, sync.json, schedule.json   written by the sibling scripts
+#
+# Security model: one shared secret, the bearer token. Only a PBKDF2 hash of it is stored, so a lost
+# token cannot be shown again, only replaced (`kloud token-new`). It is meant for a trusted LAN or
+# for use through WireGuard, not for direct exposure to the internet (see SAFETY_CHECKLIST).
+#
+# Run : ./kloud            interactive menu
+#       ./kloud init --root /Volumes/SSD/kloud --tls ; ./kloud start ; ./kloud status
+# Needs: Python 3.8+ (stdlib only); openssl on PATH for --tls; scutil (macOS) is optional.
+# Limits: no automated tests; flat folder only (no sub-directories); the server has no upload size
+#         limit or rate limiting; see the notes on the HTML page and the handler for known weaknesses.
 import argparse
 import hashlib
 import hmac
@@ -36,41 +61,81 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+# Everything lives next to the script (not in the user's home) so the whole tool can be carried on
+# the same drive it manages. resolve() follows symlinks so the path is stable.
 HERE = Path(__file__).resolve().parent
+
+# Persistent settings; created by `kloud init`.
 CONFIG_PATH = HERE / ".kloud" / "config.json"
+
+# Runtime state of the background server (pid, port, start time); removed by `kloud stop`.
 STATE_PATH = HERE / ".kloud" / "state.json"
+
+# Sibling scripts invoked by the wizards; resolved from HERE so they work from any working directory.
 VPN_SCRIPT = HERE / "kloud-vpn"
 SYNC_SCRIPT = HERE / "kloud-sync"
 SCHEDULE_SCRIPT = HERE / "kloud-schedule"
 
 
-# Step 1: Read server configuration and bearer token salt from local state
 def load_config():
+    """Read .kloud/config.json and return it as a dict.
+
+    Exits with a hint to run `kloud init` when the file does not exist, which turns a missing setup into
+    a readable message instead of a traceback.
+    """
+
+    # Not configured yet: a clear instruction is more useful than a FileNotFoundError traceback.
     if not CONFIG_PATH.exists():
         sys.exit("No config found. Run `kloud init --root /path/to/drive` first.")
     return json.loads(CONFIG_PATH.read_text())
 
 
 def save_config(cfg):
+    """Write `cfg` to .kloud/config.json (creating the folder) with owner-only permissions.
+
+    Args:
+        cfg: dict with root, salt, token_hash, tls and optionally cert and key.
+
+    The chmod to 0o600 matters: the file holds the token hash and salt, which an attacker could use to
+    test password guesses offline, so other local users must not read it.
+    """
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
     os.chmod(CONFIG_PATH, 0o600)
 
 
 def hash_token(token, salt):
+    """Return the PBKDF2-HMAC-SHA256 hash (hex) of `token` using the hex-encoded `salt`.
+
+    200,000 iterations make each guess slow, which hurts an attacker who steals config.json; a real
+    request pays that cost once per call, which is acceptable for a personal server. The token is a
+    random 32-byte value, so brute force is already impractical; the hash mainly protects against
+    the config file leaking.
+    """
     return hashlib.pbkdf2_hmac("sha256", token.encode(), bytes.fromhex(salt), 200_000).hex()
 
 
 def _read_state():
+    """Return the saved server state dict, or {} when the file is missing or unreadable.
+
+    A corrupt state file is treated as "nothing running" rather than crashing status commands.
+    """
     if STATE_PATH.exists():
         try:
             return json.loads(STATE_PATH.read_text())
+
+        # No network at all: fall back to loopback so callers still print a usable (local-only) URL.
         except Exception:
             return {}
     return {}
 
 
 def _pid_alive(pid):
+    """Return True if a process with this pid exists.
+
+    os.kill(pid, 0) sends no signal; it only checks existence and permission. A pid that was reused by an
+    unrelated process would look alive, a small risk accepted for a personal tool.
+    """
     try:
         os.kill(pid, 0)
         return True
@@ -79,6 +144,7 @@ def _pid_alive(pid):
 
 
 def _running_info():
+    """Return (running, pid, port) for the background server from state.json and a liveness check."""
     st = _read_state()
     pid = st.get("pid")
     if pid and _pid_alive(pid):
@@ -91,6 +157,9 @@ def lan_ip():
     asks the OS which interface would be used, so it works offline too."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        # Connecting a UDP socket sends no packet; it only makes the OS choose the outgoing interface, whose
+        # address getsockname() then returns. 8.8.8.8 is just a routable address, never contacted.
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
@@ -104,16 +173,24 @@ def bonjour_host():
     by default). Unlike a raw IP, it keeps working across DHCP renewals and
     WiFi band switches -- worth using instead of the IP on flaky networks."""
     try:
+        # macOS stores the Bonjour name here. The 2 s timeout keeps status commands snappy if scutil hangs.
         r = subprocess.run(["scutil", "--get", "LocalHostName"], capture_output=True, text=True, timeout=2)
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip() + ".local"
+
+    # scutil does not exist off macOS; treat that and a hang the same way: no .local name available.
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return None
 
 
-# Step 2: Probe TCP socket availability to verify active server listener
 def _reachable_at(scheme, port):
+    """Return a user-facing message saying how to reach the server (a .local name if available, plus the IP).
+
+    Args:
+        scheme: "http" or "https".
+        port: TCP port the server listens on.
+    """
     host = bonjour_host()
     if host:
         return (
@@ -124,25 +201,39 @@ def _reachable_at(scheme, port):
     return f"Reach it at: {scheme}://{lan_ip()}:{port}/  (from another device on this network, or over the VPN)"
 
 
-# Step 3: Spawn background daemon process and record PID into state file
 def cmd_start(args):
+    """Start `kloud serve` as a detached background process and record it in state.json.
+
+    Args: args.port (optional, default 8443). Does nothing if a live server is already recorded.
+    """
     if not CONFIG_PATH.exists():
         sys.exit("Not set up yet -- run the guided setup first (menu option 1, or `kloud init --root ...`).")
+    # Refuse to start a second server: two processes would fight over the same port and state file.
     running, pid, _ = _running_info()
     if running:
         print(f"Already running (pid {pid}).")
         return
+
+    # 8443 is the conventional alternative HTTPS port; getattr because the menu passes a bare Namespace.
     port = getattr(args, "port", None) or 8443
     log_path = HERE / ".kloud" / "server.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Append mode keeps the log from earlier runs. start_new_session detaches the child from this
+    # terminal, so closing the terminal does not kill the server (it would otherwise get SIGHUP).
     with open(log_path, "ab") as logf:
         proc = subprocess.Popen(
             [sys.executable, str(HERE / "kloud"), "serve", "--port", str(port)],
             stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
         )
+
+    # Short grace period, then poll(): if the child already exited (port in use, bad config), report it
+    # now instead of claiming success.
     time.sleep(0.5)
     if proc.poll() is not None:
         sys.exit(f"Server failed to start -- check {log_path} for details.")
+
+    # Remember pid and port so `stop` and `status` (and the menu) can find the server later.
     STATE_PATH.write_text(json.dumps(
         {"pid": proc.pid, "port": port, "started_at": datetime.now(timezone.utc).isoformat()}, indent=2
     ))
@@ -152,8 +243,10 @@ def cmd_start(args):
     print(_reachable_at(scheme, port))
 
 
-# Step 4: Terminate active background daemon using standard POSIX signals
 def cmd_stop(args):
+    """Stop the background server with SIGTERM and clear state.json."""
+
+    # Nothing recorded as running (or the recorded pid is dead): say so instead of failing.
     running, pid, _ = _running_info()
     if not running:
         print("Server isn't running.")
@@ -162,6 +255,9 @@ def cmd_stop(args):
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
+
+    # Wait up to 4 s (20 x 0.2 s) for the server to exit; the state file is removed regardless, so a stuck
+    # process never blocks a restart attempt. No SIGKILL is sent.
     for _ in range(20):
         if not _pid_alive(pid):
             break
@@ -172,6 +268,10 @@ def cmd_stop(args):
 
 
 def cmd_status(args):
+    """Print storage, HTTPS, server, VPN, sync and schedule status by reading the files in .kloud/.
+
+    It only inspects files (and checks the pid), so it works even when nothing is running.
+    """
     print("--- kloud status ---")
     if CONFIG_PATH.exists():
         cfg = json.loads(CONFIG_PATH.read_text())
@@ -187,6 +287,9 @@ def cmd_status(args):
         print(_reachable_at(scheme, port))
     else:
         print("server: off")
+
+    # The VPN, sync and schedule lines each report whether the matching sibling script has saved its
+    # settings; this function never runs those scripts.
     if (HERE / ".kloud" / "wg" / "wg0.conf").exists():
         print("VPN: configured")
     else:
@@ -207,6 +310,12 @@ def cmd_status(args):
 
 
 def make_self_signed_cert():
+    """Create a self-signed certificate and key in .kloud/ with openssl and return (cert_path, key_path).
+
+    RSA 2048, valid 10 years (-days 3650), no passphrase (-nodes) because the server must start
+    unattended. Self-signed means browsers warn on first visit (see the safety checklist). Raises
+    subprocess.CalledProcessError when openssl fails and FileNotFoundError when it is not installed.
+    """
     cert_dir = HERE / ".kloud"
     cert_dir.mkdir(parents=True, exist_ok=True)
     cert, key = cert_dir / "cert.pem", cert_dir / "key.pem"
@@ -222,10 +331,25 @@ def make_self_signed_cert():
 
 
 def cmd_init(args):
+    """Create the configuration: storage root, a new random token, and optionally a TLS certificate.
+
+    Args: args.root (folder to store files in, created if needed), args.tls (bool).
+
+    The token is generated here, printed once, and only its salted hash is saved, so nobody (not even
+    this program) can show it again later. Running init again replaces the config and invalidates
+    the old token.
+    """
     root = Path(args.root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
+
+    # Fresh 16-byte random salt per token, so identical tokens never produce identical hashes.
     salt = secrets.token_hex(16)
+
+    # 32 random bytes (256 bits) from the OS CSPRNG, URL-safe so it can be pasted into headers and curl.
     token = secrets.token_urlsafe(32)
+
+    # Config schema: root (storage folder), salt + token_hash (see hash_token), tls flag, and cert/key
+    # paths added below when TLS is chosen.
     cfg = {
         "root": str(root),
         "salt": salt,
@@ -238,12 +362,15 @@ def cmd_init(args):
         cfg["key"] = str(key)
     save_config(cfg)
     print(f"Storage root: {root}")
+
+    # The only time the plaintext token exists outside the user's own storage; it is not saved anywhere.
     print(f"Your access token (save this now, it will not be shown again):\n")
     print(f"  {token}\n")
     print("Give this token only to devices you want to allow (curl, browser, etc).")
 
 
 def cmd_token_new(args):
+    """Issue a new token, replacing the stored hash so the previous token stops working immediately."""
     cfg = load_config()
     salt = secrets.token_hex(16)
     token = secrets.token_urlsafe(32)
@@ -253,6 +380,7 @@ def cmd_token_new(args):
     print(f"New token (old one is now invalid):\n\n  {token}\n")
 
 
+# Text shown by `kloud safety` and menu option 9. Kept as data so it can be edited without touching logic.
 SAFETY_CHECKLIST = """
 kloud safety checklist
 -----------------------
@@ -276,6 +404,10 @@ kloud safety checklist
 
 
 def cmd_safety(args):
+    """Print the safety checklist, then run live checks (TLS, config permissions, VPN, .kloud git-ignored).
+
+    Each check prints [ok], [warn] or [--] (not applicable yet) so problems stand out.
+    """
     print(SAFETY_CHECKLIST)
     print("--- live checks ---")
     if CONFIG_PATH.exists():
@@ -283,6 +415,8 @@ def cmd_safety(args):
         cfg = json.loads(CONFIG_PATH.read_text())
         tls_on = bool(cfg.get("tls"))
         print(f"[{'ok' if tls_on else 'warn'}] TLS {'enabled' if tls_on else 'disabled -- fine on a trusted LAN only'}")
+
+        # Last three octal digits are the owner/group/other permission bits; anything but 600 means other users could read the hash.
         mode = oct(CONFIG_PATH.stat().st_mode)[-3:]
         print(f"[{'ok' if mode == '600' else 'warn'}] config file permissions are {mode} (want 600)")
     else:
@@ -290,6 +424,8 @@ def cmd_safety(args):
     wg_dir = HERE / ".kloud" / "wg"
     print(f"[{'ok' if wg_dir.exists() else '--'}] VPN {'configured' if wg_dir.exists() else 'not set up yet (`kloud-vpn`)'}")
     try:
+        # `git check-ignore -q` exits 0 when the path is ignored, so a missing .gitignore entry (which could leak
+        # the token hash into a repository) shows as a warning.
         ignored = subprocess.run(
             ["git", "check-ignore", "-q", str(HERE / ".kloud")],
             cwd=HERE, capture_output=True,
@@ -300,12 +436,17 @@ def cmd_safety(args):
 
 
 def _ask(prompt, default=None):
+    """Prompt on the terminal and return the answer, or `default` when the user just presses Enter."""
     suffix = f" [{default}]" if default else ""
     val = input(f"{prompt}{suffix}: ").strip()
     return val or default
 
 
 def _status_line():
+    """Return the one-line summary (storage, server, VPN, sync) shown at the top of the menu.
+
+    Note that "VPN: connected" only means a wg0.conf exists, not that the tunnel is up.
+    """
     storage = "set up" if CONFIG_PATH.exists() else "NOT set up"
     running, _, _ = _running_info()
     server = "ON" if running else "off"
@@ -315,6 +456,10 @@ def _status_line():
 
 
 def wizard_first_time():
+    """Guided setup: ask for the storage folder and HTTPS preference, run init, optionally start the server.
+
+    Asks for confirmation first if the machine is already configured, because init replaces the token.
+    """
     print("\nLet's get you set up -- takes about a minute.\n")
     if CONFIG_PATH.exists():
         if _ask("kloud is already set up on this machine. Start over from scratch?", "n").lower() != "y":
@@ -334,6 +479,7 @@ def wizard_first_time():
 
 
 def wizard_token():
+    """Explain what the token is and offer to generate a new one (the old token stops working)."""
     if not CONFIG_PATH.exists():
         print("Set up storage first (option 1).")
         return
@@ -345,8 +491,14 @@ def wizard_token():
 
 
 def wizard_vpn():
+    """Guided WireGuard setup: create this machine's identity if missing, then add the other machine.
+
+    Delegates to kloud-vpn (init, peer add, config) so key handling stays in one place. Run it on both machines.
+    """
     print("\nThis connects your two machines securely over the internet, so they")
     print("don't need to be on the same WiFi. Do this once on EACH machine.")
+
+    # self.json is written by `kloud-vpn init` and holds this machine's name, tunnel address and public key.
     self_path = HERE / ".kloud" / "wg" / "self.json"
     if not self_path.exists():
         print("\nFirst, this machine needs its own identity.")
@@ -374,6 +526,10 @@ def wizard_vpn():
 
 
 def wizard_sync():
+    """Guided sync: ask for the other machine's address, ssh user and kloud folder once, then run a sync now.
+
+    The details are saved by kloud-sync, so later runs skip the questions.
+    """
     if not CONFIG_PATH.exists():
         print("Set up storage first (option 1).")
         return
@@ -386,6 +542,8 @@ def wizard_sync():
         if not (host and user and root):
             print("Need all three -- cancelled.")
             return
+
+        # kloud-sync remembers these answers in .kloud/sync.json, so this question is only asked once per machine.
         r = subprocess.run([str(SYNC_SCRIPT), "setup", "--peer-host", host,
                              "--peer-user", user, "--peer-root", root])
         if r.returncode != 0:
@@ -395,6 +553,7 @@ def wizard_sync():
 
 
 def wizard_schedule():
+    """Guided schedule: ask for daily on/off times and optionally install the background scheduler."""
     print("\nSet the hours THIS machine should be on and syncing. Outside those")
     print("hours it turns itself off, so it isn't running around the clock.")
     start = _ask("Turn on at (24h HH:MM, e.g. 21:00)")
@@ -402,6 +561,8 @@ def wizard_schedule():
     if not (start and end):
         print("Need both times -- cancelled.")
         return
+
+    # kloud-schedule validates the times and saves .kloud/schedule.json; `install` below registers the recurring job.
     r = subprocess.run([str(SCHEDULE_SCRIPT), "set", "--start", start, "--end", end])
     if r.returncode != 0:
         return
@@ -411,6 +572,7 @@ def wizard_schedule():
             print(f"You can still trigger a check by hand any time with: {SCHEDULE_SCRIPT} run")
 
 
+# Interactive menu text; {status} is filled with _status_line() each time it is shown.
 MENU = """
 ================ kloud ================
 {status}
@@ -429,10 +591,16 @@ MENU = """
 
 
 def cmd_menu(args):
+    """Run the interactive menu loop until the user quits.
+
+    Every action runs inside try/except so a failed step (including sys.exit calls in the helpers, which
+    raise SystemExit) returns to the menu instead of closing the program.
+    """
     while True:
         print(MENU.format(status=_status_line()))
         choice = input("> ").strip().lower()
         try:
+            # Menu dispatch: each number maps to one command or wizard; unknown input just reprompts.
             if choice == "1":
                 wizard_first_time()
             elif choice == "2":
@@ -455,14 +623,27 @@ def cmd_menu(args):
                 break
             else:
                 print("Please enter a number from the menu.")
+
+        # The helper functions call sys.exit("message") for user errors; catch it so the menu stays open and shows the message.
         except SystemExit as e:
             print(f"\n{e.code if isinstance(e.code, str) else 'That step stopped early.'}")
             print("Nothing was damaged -- you're back at the menu.")
+
+        # Last-resort catch for the interactive loop only: unexpected errors are shown, then the user is returned to the menu.
         except Exception as e:
             print(f"\nSomething went wrong: {e}")
             print("Nothing was damaged -- you're back at the menu.")
 
 
+# The whole browser UI is embedded here so the server stays a single stdlib-only file. Served at "/"
+# without authentication (it contains no data); everything it shows comes from the authenticated
+# /api/files calls it makes with the token typed into the page. The token is kept in sessionStorage
+# (cleared when the tab closes) and sent as an Authorization header, never in a URL.
+# Known weaknesses of this page: file names are inserted into innerHTML and onclick attributes without
+# escaping, so a file name containing quotes or HTML would break the table or run script in the
+# viewer's browser; only people holding the token can create such files, but names arriving through
+# sync from another machine are also affected. Downloads are buffered in memory (blob), so very large
+# files are better fetched with curl.
 INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -551,14 +732,34 @@ refresh();
 """
 
 
+# HTTP request handler (one instance per request, run in its own thread by ThreadingHTTPServer).
+# REST-style API on a single flat folder:
+#   GET    /                 browser page (no auth)
+#   GET    /api/files        JSON list of {name, size, mtime}                 (auth)
+#   GET    /api/files/<name> download, streamed in 1 MiB chunks                 (auth)
+#   PUT    /api/files/<name> upload, streamed to <name>.part then renamed       (auth)
+#   DELETE /api/files/<name> delete                                             (auth)
+# `cfg` is set once by cmd_serve before any request arrives and is shared read-only by all threads.
 class Handler(http.server.BaseHTTPRequestHandler):
+    # Loaded configuration dict (see cmd_serve); a class attribute because handler instances are created by the server.
     cfg = None
+
+    # Value of the HTTP Server header: names the program without leaking the Python version.
     server_version = "kloud/1"
 
     def log_message(self, fmt, *a):
+        """Write access-log lines to stderr (which cmd_start redirects into .kloud/server.log).
+
+        Overrides the default to keep the standard format but never log request bodies or headers, so the token is not logged.
+        """
         sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % a))
 
     def _authed(self):
+        """Return True if the request carries a valid `Authorization: Bearer <token>` header.
+
+        The submitted token is hashed with the stored salt and compared with hmac.compare_digest, a constant-time
+        comparison, so response timing does not reveal how many leading characters matched.
+        """
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return False
@@ -567,18 +768,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return hmac.compare_digest(given_hash, self.cfg["token_hash"])
 
     def _deny(self):
+        """Send 401 Unauthorized with a WWW-Authenticate header (the HTTP way to say "a token is required")."""
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Bearer realm="kloud"')
         self.end_headers()
 
     def _safe_path(self, name):
+        """Map a URL file name to a path inside the storage root, or None if the name is not acceptable.
+
+        Path-traversal defence: the name is percent-decoded, then anything containing "/" or equal to "." or
+        ".." is refused, so the result is always a direct child of the root and `../secret` cannot escape. The
+        folder is flat by design; sub-directories are not supported. (A name with a backslash or NUL is not
+        specially handled; on POSIX a backslash is an ordinary character.)
+        """
         name = unquote(name)
         if not name or "/" in name or name in (".", ".."):
             return None
         return Path(self.cfg["root"]) / name
 
     def do_GET(self):
+        """Handle GET: the web page, the file list, and file downloads."""
         parsed = urlparse(self.path)
+
+        # The page itself is public so a browser can load it before a token has been typed.
         if parsed.path == "/":
             body = INDEX_HTML.encode()
             self.send_response(200)
@@ -593,6 +805,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             root = Path(self.cfg["root"])
             files = []
             for p in sorted(root.iterdir()):
+                # Hide in-progress uploads (.part files) and sub-directories from the listing.
                 if p.is_file() and not p.name.endswith(".part"):
                     st = p.stat()
                     files.append({
@@ -623,6 +836,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f'attachment; filename="{p.name}"')
             self.end_headers()
             with p.open("rb") as f:
+                # Stream in 1 MiB chunks so memory use stays constant for multi-gigabyte files.
                 while chunk := f.read(1 << 20):
                     self.wfile.write(chunk)
             return
@@ -630,6 +844,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_PUT(self):
+        """Handle PUT: upload a file, replacing any existing file of that name.
+
+        Reads exactly Content-Length bytes in 1 MiB chunks into "<name>.part", then renames it into place.
+        The rename is atomic on one filesystem, so readers never see a half-written file. Known limits: a
+        client that disconnects early still leaves a truncated file that gets renamed into place (the loop
+        just stops on an empty read), and there is no size limit or free-space check. Chunked uploads
+        without Content-Length are treated as empty.
+        """
         parsed = urlparse(self.path)
         if not parsed.path.startswith("/api/files/"):
             self.send_response(404); self.end_headers(); return
@@ -653,6 +875,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_DELETE(self):
+        """Handle DELETE: remove a file by name. Responds 204 on success, 404 if missing."""
         parsed = urlparse(self.path)
         if not parsed.path.startswith("/api/files/"):
             self.send_response(404); self.end_headers(); return
@@ -666,15 +889,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 
+# One thread per connection so a slow upload does not block other clients. daemon_threads lets the
+# process exit without waiting for in-flight transfers.
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
-# Step 5: Initialize HTTP/HTTPS server request handler loop with SSL context
 def cmd_serve(args):
+    """Run the HTTP(S) server in the foreground until interrupted (used directly or by cmd_start).
+
+    Args: args.port (TCP port). Binds to 0.0.0.0 (all interfaces) so other devices can connect; restrict
+    access with the firewall or WireGuard (see the checklist).
+    """
     cfg = load_config()
     Handler.cfg = cfg
     server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+
+    # Wrap the listening socket with TLS so the token and files are encrypted on the wire. The self-signed
+    # cert gives encryption but no identity proof, hence the browser warning on first visit.
     if cfg.get("tls"):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cfg["cert"], cfg["key"])
@@ -692,6 +924,7 @@ def cmd_serve(args):
 
 
 def main():
+    """Parse the command line and dispatch; with no sub-command, open the interactive menu."""
     parser = argparse.ArgumentParser(prog="kloud", description="Self-hosted file store, zero dependencies.")
     sub = parser.add_subparsers(dest="cmd")
 
@@ -723,6 +956,7 @@ def main():
     p_status = sub.add_parser("status", help="show storage/server/VPN/sync/schedule status")
     p_status.set_defaults(func=cmd_status)
 
+    # Sub-command functions are attached with set_defaults(func=...); a bare `kloud` means "menu".
     args = parser.parse_args()
     if args.cmd is None:
         cmd_menu(args)

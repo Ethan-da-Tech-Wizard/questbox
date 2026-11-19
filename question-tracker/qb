@@ -13,49 +13,119 @@ questbox (qb) -- a personal question-tracking CLI backed by SQLite.
 File every question you ask into a real database, then query the scope and
 flow of your own thinking with SQL. See `qb --help` and README.md.
 """
+
+# How the pieces fit
+# ------------------
+# `qb` is the only program in the question-tracker folder. It is a single-file command-line front end over
+# a SQLite database; schema.sql (same folder) defines every table, index, full-text index and analytic
+# view, and `qb init` loads that file. The code below does simple inserts and updates, and leaves the
+# analysis to SQL views, so the interesting numbers (rhythm by hour, tag pairs, bursts, follow-up chain
+# size) can also be read with `qb sql` or `qb shell` without touching Python.
+#
+# Data flow: argparse (build_parser) picks a cmd_* function -> it calls connect() for a connection with
+# foreign keys on -> runs SQL -> prints text. Each cmd_* function takes the parsed `args` namespace and
+# returns nothing; failures end the process with sys.exit(message).
+#
+# Environment : QUESTBOX_DB overrides where the database file lives (default: questbox.db next to this
+#               script). Useful for tests or for keeping a private database elsewhere.
+# Run         : ./qb init, ./qb add "text" -c category -t tag1,tag2 -e 4, ./qb stats ... (see qb --help)
+# Requires    : Python 3 and an SQLite build with FTS5 (standard in current Python). `qb shell` also needs
+#               the sqlite3 command-line program.
+# Limits      : no automated tests; a single user and a single local file (no locking beyond SQLite's own);
+#               see the notes on cmd_answer, cmd_link and cmd_sql for specific edge cases.
 import argparse
 import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta
 
+# Folder of this script, so the default database and schema.sql are found no matter where `qb` is run from.
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# QUESTBOX_DB lets the user (or a test) point the tool at a different database file.
 DB_PATH = os.environ.get("QUESTBOX_DB", os.path.join(HERE, "questbox.db"))
+
+# The schema is read at `qb init` time only.
 SCHEMA_PATH = os.path.join(HERE, "schema.sql")
+
+# Burst detection threshold in minutes. A new question within 20 minutes of the previous one joins the
+# same "session"; 20 is a judgement value (long enough for a pause to think, short enough to separate
+# separate sittings). Override per question with `qb add --session-gap`.
 DEFAULT_SESSION_GAP_MIN = 20  # questions within this many minutes = same burst
 
 
-# Step 1: Establish verified SQLite database connection with active foreign key constraints
 def connect():
+    """Open the questbox database with foreign keys enforced.
+
+    Returns:
+        sqlite3.Connection whose rows can be read by column name (row_factory = sqlite3.Row).
+
+    Exits:
+        The process exits with a message if the database file does not exist yet, so a typo in
+        QUESTBOX_DB cannot silently create a new empty database (only `qb init` creates one).
+    """
     if not os.path.exists(DB_PATH):
         sys.exit(f"No database at {DB_PATH}. Run `qb init` first.")
     con = sqlite3.connect(DB_PATH)
+
+    # SQLite ignores FOREIGN KEY clauses unless this is set on every new connection; without it the
+    # ON DELETE SET NULL / CASCADE rules in schema.sql would not run.
     con.execute("PRAGMA foreign_keys = ON")
     con.row_factory = sqlite3.Row
     return con
 
 
 def now_str():
+    """Return the current local time as 'YYYY-MM-DDTHH:MM:SS'.
+
+    This is the same text format the schema's default for questions.created_at produces, so Python-written
+    and SQL-written timestamps sort and compare correctly as plain strings.
+    """
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
-# Step 2: Format tabular output dynamically aligning columns to maximum character width
 def print_table(headers, rows):
+    """Print `rows` under `headers` as a plain-text table, or "(no rows)" when empty.
+
+    Args:
+        headers: list of column titles.
+        rows: list of row sequences (each as long as headers); every value is converted with str().
+    """
     if not rows:
         print("(no rows)")
         return
+
+    # Transpose to columns so each column's widest cell (header included) can be measured.
     cols = [list(map(str, [h] + [r[i] for r in rows])) for i, h in enumerate(headers)]
     widths = [max(len(c) for c in col) for col in cols]
+
+    # Left-align each cell to its column width and separate columns with two spaces.
     def fmt(vals):
         return "  ".join(str(v).ljust(w) for v, w in zip(vals, widths))
     print(fmt(headers))
+
+    # Dashed rule under the header, one dash run per column.
     print("  ".join("-" * w for w in widths))
     for r in rows:
         print(fmt(r))
 
 
-# Helper: Retrieve existing entity identifier or insert a new record atomically
 def get_or_create(con, table, name):
+    """Return the id of the row named `name` in `table`, inserting it if needed.
+
+    Args:
+        con: open connection from connect().
+        table: "categories" or "tags". Interpolated into the SQL text, so it must only ever be one of those
+            fixed literals from this file, never user input (the value `name` is passed safely as a bound parameter).
+        name: the category or tag text, or None.
+
+    Returns:
+        The row id, or None when `name` is None (no category given).
+
+    Side effects:
+        May insert one row; the caller is responsible for con.commit().
+    """
+    # Callers pass args.category straight through; None means "no category".
     if name is None:
         return None
     cur = con.execute(f"SELECT id FROM {table} WHERE name = ?", (name,))
@@ -66,57 +136,108 @@ def get_or_create(con, table, name):
     return cur.lastrowid
 
 
-# Logic: Cluster questions asked within temporal window into unified inquiry session
+
+# (Docstring below states the rule.) Return the session id for a question being filed now.
+#
+# Reuses the previous question's session when that question is at most `gap_minutes` old, extending the
+# session's ended_at; otherwise opens a new session. Sessions are what the v_bursts view groups on.
+#
+# Args:
+#     con: open connection from connect().
+#     gap_minutes: allowed pause in minutes between two questions of one session.
+#
+# Returns:
+#     The session id (existing or newly created). The caller commits.
+#
+# Note:
+#     The comparison uses the most recent question by id, not by time, which is the same thing unless rows
+#     are inserted by hand out of order.
 def resolve_session(con, gap_minutes):
     """Reuse the most recent session if the last question was asked within
     gap_minutes; otherwise start a new one. This is what auto-detects bursts."""
+
+    # Only the newest question matters: a session is a run of consecutive questions.
     cur = con.execute("SELECT id, created_at, session_id FROM questions ORDER BY id DESC LIMIT 1")
     last = cur.fetchone()
     now = datetime.now()
+
+    # A previous question filed with --no-session has no session to extend, so it falls through to a new session.
     if last and last["session_id"] is not None:
         last_time = datetime.strptime(last["created_at"], "%Y-%m-%dT%H:%M:%S")
+
+        # Close enough in time: extend the existing session's end so its span stays accurate.
         if now - last_time <= timedelta(minutes=gap_minutes):
             con.execute("UPDATE sessions SET ended_at = ? WHERE id = ?", (now_str(), last["session_id"]))
             return last["session_id"]
+
+    # No session to reuse: start one whose start and end are both "now"; later questions will push ended_at forward.
     cur = con.execute("INSERT INTO sessions(started_at, ended_at) VALUES (?, ?)", (now_str(), now_str()))
     return cur.lastrowid
 
 
 # ---------------------------------------------------------------- commands
 
-# Command Handler: Initialize database schema with tables, indexes, views, and FTS5 triggers
 def cmd_init(args):
+    """Create (or re-apply the schema to) the database. `args.force` allows an existing file.
+
+    Safe to repeat with --force because every statement in schema.sql uses IF NOT EXISTS; it never drops
+    data. Without --force an existing database is left alone and the command exits with a message.
+    """
     if os.path.exists(DB_PATH) and not args.force:
         sys.exit(f"{DB_PATH} already exists. Pass --force to reapply schema (safe: uses IF NOT EXISTS).")
+
+    # Plain connect (not connect()), because connect() refuses to run when the file does not exist yet.
     con = sqlite3.connect(DB_PATH)
     with open(SCHEMA_PATH) as f:
+        # executescript runs the whole multi-statement file, including the triggers, in one call.
         con.executescript(f.read())
     con.commit()
     con.close()
     print(f"Initialized {DB_PATH}")
 
 
-# Command Handler: Insert new question with category resolution, tag linking, and session assignment
 def cmd_add(args):
+    """Insert a question and link its category, tags and session.
+
+    Uses args.text, category, tags (comma-separated), energy (1-5), parent (id of the question this follows
+    up), session_gap and no_session. Prints "#<id> filed." Everything is committed once at the end, so a
+    failure part way (for example a parent id that does not exist, which violates the foreign key) leaves
+    nothing half-written.
+    """
     con = connect()
+
+    # Categories are created on first use, so no setup step is needed before a new category name.
     category_id = get_or_create(con, "categories", args.category) if args.category else None
+
+    # --no-session keeps one-off or imported questions out of burst statistics.
     session_id = None if args.no_session else resolve_session(con, args.session_gap)
     cur = con.execute(
         "INSERT INTO questions(text, category_id, energy_level, parent_id, session_id) "
         "VALUES (?, ?, ?, ?, ?)",
         (args.text, category_id, args.energy, args.parent, session_id),
     )
+
+    # Needed to attach tags to the row just inserted.
     qid = cur.lastrowid
+
+    # Split on commas, trim spaces and drop empty pieces so "a, b,," yields the tags a and b.
     if args.tags:
         for tag in [t.strip() for t in args.tags.split(",") if t.strip()]:
             tag_id = get_or_create(con, "tags", tag)
+
+            # OR IGNORE: the same tag typed twice in one command is not an error (primary key is the pair).
             con.execute("INSERT OR IGNORE INTO question_tags(question_id, tag_id) VALUES (?, ?)", (qid, tag_id))
     con.commit()
     print(f"#{qid} filed.")
 
 
-# Command Handler: Record answer text, transition status, and timestamp resolution
 def cmd_answer(args):
+    """Set the answer text, answered_at and status = 'answered' for question args.id.
+
+    Known limit: the UPDATE does not check how many rows it changed, so answering an id that does not exist
+    prints "marked answered" even though nothing happened. The update also fires the FTS update trigger so
+    the answer becomes searchable.
+    """
     con = connect()
     con.execute(
         "UPDATE questions SET answer = ?, answered_at = ?, status = 'answered' WHERE id = ?",
@@ -127,6 +248,12 @@ def cmd_answer(args):
 
 
 def cmd_status(args):
+    """Set the status of question args.id to args.status (open, exploring, answered or abandoned).
+
+    The status values are enforced twice: by argparse choices and by a CHECK constraint in schema.sql.
+    Setting 'answered' this way does not set answered_at or an answer; use `qb answer` for that.
+    As with cmd_answer, an unknown id is silently a no-op.
+    """
     con = connect()
     con.execute("UPDATE questions SET status = ? WHERE id = ?", (args.status, args.id))
     con.commit()
@@ -134,6 +261,11 @@ def cmd_status(args):
 
 
 def cmd_tag(args):
+    """Attach the comma-separated tags in args.tags to question args.id, creating tags as needed.
+
+    Re-adding a tag the question already has is ignored (INSERT OR IGNORE). An unknown question id
+    raises a foreign-key error because question_tags references questions(id).
+    """
     con = connect()
     for tag in [t.strip() for t in args.tags.split(",") if t.strip()]:
         tag_id = get_or_create(con, "tags", tag)
@@ -143,6 +275,11 @@ def cmd_tag(args):
 
 
 def cmd_untag(args):
+    """Remove the comma-separated tags in args.tags from question args.id.
+
+    Only the link row is deleted; the tag itself stays in `tags`, so it stays available for reuse but no
+    longer shows in the tag counts, because the tag views only count tags attached to a question. Unknown tags are silently ignored.
+    """
     con = connect()
     for tag in [t.strip() for t in args.tags.split(",") if t.strip()]:
         con.execute(
@@ -153,29 +290,46 @@ def cmd_untag(args):
     print(f"#{args.id} untagged: {args.tags}")
 
 
-# Command Handler: Establish directed parental relationship between question nodes
 def cmd_link(args):
+    """Make question args.child_id a follow-up of args.parent_id (sets parent_id).
+
+    Known limit: no cycle check. Linking a question under its own descendant (or to itself) creates a loop,
+    and the recursive queries in cmd_chain would then never finish. Link only older to newer threads.
+    """
     con = connect()
     con.execute("UPDATE questions SET parent_id = ? WHERE id = ?", (args.parent_id, args.child_id))
     con.commit()
     print(f"#{args.child_id} linked as follow-up of #{args.parent_id}")
 
 
-# Command Handler: Query and filter question collection by status, category, tag, or time
 def cmd_list(args):
+    """Print recent questions, optionally filtered by status, category, tag, today or a start date.
+
+    Args are optional filters combined with AND, plus `limit` (default 30). Text is cut to 70 characters
+    for table width; use `qb show <id>` for the full text.
+    """
     con = connect()
+
+    # Build the WHERE clause dynamically. User values only ever go into `params` (bound parameters), never
+    # into the SQL text, which keeps the query safe from SQL injection.
     clauses, params = [], []
     if args.status:
         clauses.append("q.status = ?"); params.append(args.status)
     if args.category:
         clauses.append("c.name = ?"); params.append(args.category)
+
+    # Subquery instead of a join so a question with several matching tags is not listed twice.
     if args.tag:
         clauses.append("q.id IN (SELECT question_id FROM question_tags qt JOIN tags t ON t.id = qt.tag_id WHERE t.name = ?)")
         params.append(args.tag)
+
+    # 'localtime' because created_at is stored in local time, so the day boundary is the user's own midnight.
     if args.today:
         clauses.append("date(q.created_at) = date('now', 'localtime')")
     if args.since:
         clauses.append("date(q.created_at) >= date(?)"); params.append(args.since)
+
+    # The f-string only inserts the fixed clause fragments built above, not user input.
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     rows = con.execute(
         f"""SELECT q.id, q.created_at, q.status, coalesce(c.name,'') AS category, q.text
@@ -188,13 +342,21 @@ def cmd_list(args):
 
 
 def cmd_show(args):
+    """Print one question in full: status, time, category, tags, energy, parent, text, answer and follow-ups.
+
+    Exits with "No question #<id>" if it does not exist.
+    """
     con = connect()
+
+    # LEFT JOIN so questions without a category are still found.
     q = con.execute("""SELECT q.*, c.name AS category FROM questions q
                         LEFT JOIN categories c ON c.id = q.category_id WHERE q.id = ?""", (args.id,)).fetchone()
     if not q:
         sys.exit(f"No question #{args.id}")
     tags = [r["name"] for r in con.execute(
         "SELECT t.name FROM question_tags qt JOIN tags t ON t.id = qt.tag_id WHERE qt.question_id = ?", (args.id,))]
+
+    # Direct follow-ups only (one level); `qb chain` shows the whole thread.
     children = con.execute("SELECT id, text FROM questions WHERE parent_id = ?", (args.id,)).fetchall()
     print(f"#{q['id']}  [{q['status']}]  {q['created_at']}")
     if q["category"]:
@@ -214,8 +376,14 @@ def cmd_show(args):
             print(f"  #{c['id']}  {c['text'][:70]}")
 
 
-# Command Handler: Trace recursive ancestor-descendant graph for a given inquiry node
 def cmd_chain(args):
+    """Print the full thread containing question args.id as an indented tree, root first.
+
+    Works in three steps inside one SQL statement: `up` climbs from the question to its ancestors,
+    `root` picks the highest ancestor (the deepest step of `up`), and `down` walks every descendant of that
+    root. Indentation is two spaces per depth level. A cycle in parent links (see cmd_link) would make the
+    recursive queries run forever.
+    """
     con = connect()
     rows = con.execute("""
         WITH RECURSIVE up(id, parent_id, depth) AS (
@@ -236,8 +404,13 @@ def cmd_chain(args):
         print(f"{'  ' * r['depth']}#{r['id']} [{r['status']}] {r['text'][:80]}")
 
 
-# Command Handler: Execute full-text BM25 search across question text and resolved answers
 def cmd_search(args):
+    """Full-text search over question and answer text using SQLite FTS5.
+
+    args.query is an FTS5 MATCH expression, so "term1 term2", "phrase in quotes", OR, NOT and prefix* work.
+    Results are ordered by the built-in BM25 `rank` (best match first). An invalid expression such as an
+    unbalanced quote raises sqlite3.OperationalError.
+    """
     con = connect()
     rows = con.execute("""
         SELECT q.id, q.created_at, q.status, q.text
@@ -249,16 +422,23 @@ def cmd_search(args):
 
 
 def cmd_categories(args):
+    """List every category in use with its question count (view v_category_freq, most used first)."""
     con = connect()
     print_table(["name", "n"], [[r["name"], r["n"]] for r in con.execute("SELECT * FROM v_category_freq")])
 
 
 def cmd_tags(args):
+    """List every tag in use with its question count (view v_tag_freq, most used first)."""
     con = connect()
     print_table(["name", "n"], [[r["name"], r["n"]] for r in con.execute("SELECT * FROM v_tag_freq")])
 
 
 def cmd_sql(args):
+    """Run an arbitrary SQL statement (args.query) and print any result rows.
+
+    This is a deliberate power feature for the single owner of the database, not a safe interface: it will
+    run INSERT, UPDATE, DELETE or DROP exactly as written. The commit at the end saves such changes.
+    """
     con = connect()
     cur = con.execute(args.query)
     rows = cur.fetchall()
@@ -269,11 +449,20 @@ def cmd_sql(args):
 
 
 def cmd_shell(args):
+    """Replace this process with the interactive `sqlite3` shell on the questbox database.
+
+    os.execvp does not return; it fails with FileNotFoundError if the sqlite3 program is not installed.
+    """
     os.execvp("sqlite3", ["sqlite3", DB_PATH])
 
 
-# Command Handler: Synthesize aggregate metrics on energy, burst cadence, and resolution rate
 def cmd_stats(args):
+    """Print a report built from the analytic views in schema.sql, one titled section each.
+
+    Sections: status breakdown, categories, top 15 tags, top 10 tag pairs, questions by hour and by
+    weekday, burst sessions (3 or more questions), longest follow-up chains, average energy per category.
+    All calculations happen in the SQL views; this function only formats them.
+    """
     con = connect()
     total = con.execute("SELECT count(*) AS n FROM questions").fetchone()["n"]
     print(f"=== questbox stats ({total} questions total) ===\n")
@@ -312,7 +501,15 @@ def cmd_stats(args):
 
 
 def build_parser():
+    """Build the command-line parser: one sub-command per cmd_* function.
+
+    Returns:
+        argparse.ArgumentParser. Each sub-parser sets `func` through set_defaults, which the entry point
+        below calls with the parsed arguments.
+    """
     p = argparse.ArgumentParser(prog="qb", description="questbox: file and mine your own questions")
+
+    # required=True: running `qb` with no command prints usage and exits instead of doing nothing.
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("init", help="create the database")
@@ -323,10 +520,14 @@ def build_parser():
     s.add_argument("text")
     s.add_argument("--category", "-c")
     s.add_argument("--tags", "-t", help="comma-separated")
+
+    # Self-rated intensity 1 (idle curiosity) to 5 (cannot stop thinking about it); matches the CHECK in the schema.
     s.add_argument("--energy", "-e", type=int, choices=range(1, 6))
     s.add_argument("--parent", "-p", type=int, help="id of question this follows up on")
     s.add_argument("--session-gap", type=int, default=DEFAULT_SESSION_GAP_MIN,
                    help="minutes of inactivity that starts a new session (default 20)")
+
+    # Skip burst tracking for this question (for example when back-filling old questions).
     s.add_argument("--no-session", action="store_true")
     s.set_defaults(func=cmd_add)
 
@@ -396,6 +597,7 @@ def build_parser():
     return p
 
 
+# Entry point: parse, then dispatch to the cmd_* function stored by set_defaults(func=...).
 if __name__ == "__main__":
     parser = build_parser()
     args = parser.parse_args()

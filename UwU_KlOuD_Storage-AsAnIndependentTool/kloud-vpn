@@ -16,6 +16,20 @@ a service) to generate keys, and writes a standard wg-quick config file
 you install yourself on each machine. Two machines, each holding the
 other's public key, that's the whole trust model.
 """
+
+# Fit: part of the kloud family (see the architecture note in `kloud`). `kloud` menu option 4 asks the
+# questions and runs `kloud-vpn init`, `peer add` and `config` for you. This script never changes the
+# network itself: it only creates keys and a wg0.conf file, and you bring the tunnel up with wg-quick.
+#
+# State in .kloud/wg/ (all inside the git-ignored .kloud folder):
+#   <name>.key   this machine's PRIVATE key (mode 600); never leaves the machine
+#   self.json    this machine's name, tunnel address, listen port, public key, key path
+#   peers.json   list of the other machines {name, pubkey, endpoint, allowed_ips}
+#   wg0.conf     generated wg-quick file; contains the private key (mode 600)
+#
+# Needs: the `wg` command (wireguard-tools). Run `kloud-vpn doctor` to check.
+# Limits: running `init` again generates a NEW key pair and overwrites self.json, so every peer must be
+# given the new public key; the listen port is fixed per machine; IPv4/IPv6 values are not validated.
 import argparse
 import json
 import shutil
@@ -23,11 +37,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Same convention as the other kloud scripts: state next to the script.
 HERE = Path(__file__).resolve().parent
 WG_DIR = HERE / ".kloud" / "wg"
 SELF_PATH = WG_DIR / "self.json"
 PEERS_PATH = WG_DIR / "peers.json"
 
+# Install commands per platform, shown whenever wireguard-tools is missing.
 INSTALL_HINT = (
     "  macOS:         brew install wireguard-tools\n"
     "  Debian/Ubuntu: sudo apt install wireguard\n"
@@ -36,12 +52,13 @@ INSTALL_HINT = (
 
 
 def require_wg():
+    """Exit with install instructions if the `wg` command is not on PATH."""
     if not shutil.which("wg"):
         sys.exit("`wg` not found. Install wireguard-tools first:\n" + INSTALL_HINT)
 
 
-# Step 1: Verify presence of host WireGuard utilities and kernel interface support
 def cmd_doctor(args):
+    """Report whether `wg` is installed and print its version. It checks the tool only, not kernel support or whether a tunnel is up (use `status`)."""
     if shutil.which("wg"):
         out = subprocess.run(["wg", "--version"], capture_output=True, text=True).stdout.strip()
         print(f"[ok] wg found: {out}")
@@ -51,24 +68,34 @@ def cmd_doctor(args):
 
 
 def load_peers():
+    """Return the saved list of peers (empty list when none)."""
     if PEERS_PATH.exists():
         return json.loads(PEERS_PATH.read_text())
     return []
 
 
 def save_peers(peers):
+    """Write the peers list to peers.json (creating .kloud/wg/ if needed)."""
     WG_DIR.mkdir(parents=True, exist_ok=True)
     PEERS_PATH.write_text(json.dumps(peers, indent=2))
 
 
-# Step 2: Generate local cryptographic keypair and initialize machine identity
 def cmd_init(args):
+    """Create this machine's WireGuard identity: a key pair, saved with its tunnel address and listen port.
+
+    Args: args.name, args.address (e.g. 10.66.0.1/24), args.listen_port (default 51820).
+    """
     require_wg()
     WG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # `wg genkey` makes a random Curve25519 private key; `wg pubkey` derives the public key from it on stdin.
+    # The private key never appears on a command line, where other users could read it from the process list.
     priv = subprocess.run(["wg", "genkey"], capture_output=True, text=True, check=True).stdout.strip()
     pub = subprocess.run(["wg", "pubkey"], input=priv, capture_output=True, text=True, check=True).stdout.strip()
     key_path = WG_DIR / f"{args.name}.key"
     key_path.write_text(priv + "\n")
+
+    # Owner-only permissions: anyone who reads this file can impersonate this machine on the VPN.
     key_path.chmod(0o600)
     self_cfg = {
         "name": args.name,
@@ -88,8 +115,12 @@ def cmd_init(args):
     print(f"this machine ({key_path}).")
 
 
-# Step 3: Register trusted peer public key, internal IP, and endpoint coordinates
 def cmd_peer_add(args):
+    """Add (or replace, matched by name) another machine in peers.json.
+
+    Args: args.name, args.pubkey (their public key), args.endpoint ("host:port" where their UDP port is
+    reachable), args.allowed_ips (their tunnel address, e.g. 10.66.0.2/32; /32 means "only this one address").
+    """
     peers = [p for p in load_peers() if p["name"] != args.name]
     peers.append({
         "name": args.name,
@@ -102,6 +133,7 @@ def cmd_peer_add(args):
 
 
 def cmd_peer_list(args):
+    """Print each configured peer with its endpoint and allowed IPs."""
     peers = load_peers()
     if not peers:
         print("(no peers yet -- `kloud-vpn peer add`)")
@@ -110,7 +142,7 @@ def cmd_peer_list(args):
         print(f"{p['name']:12} endpoint={p['endpoint']:24} allowed_ips={p['allowed_ips']}")
 
 
-# Step 4: Synthesize standardized wg-quick configuration files for deployment
+# cmd_config below already has a docstring that explains WireGuard's handshake and routing model.
 def cmd_config(args):
     """
     Renders production wg-quick tunnel interface and peer stanza configuration.
@@ -130,6 +162,8 @@ def cmd_config(args):
          stateful firewall / NAT translation table entries alive, allowing
          bidirectional communication across home routers and mobile carriers.
     """
+
+    # Both the identity and at least one peer are required: a config with no peers would bring up an interface that talks to nobody.
     if not SELF_PATH.exists():
         sys.exit("Run `kloud-vpn init` first.")
     self_cfg = json.loads(SELF_PATH.read_text())
@@ -137,6 +171,8 @@ def cmd_config(args):
     peers = load_peers()
     if not peers:
         sys.exit("No peers configured yet -- `kloud-vpn peer add` first.")
+
+    # Build the wg-quick file as plain text lines. [Interface] describes this machine; one [Peer] block per other machine follows.
     lines = [
         "[Interface]",
         f"PrivateKey = {priv}",
@@ -151,11 +187,14 @@ def cmd_config(args):
             f"PublicKey = {p['pubkey']}",
             f"Endpoint = {p['endpoint']}",
             f"AllowedIPs = {p['allowed_ips']}",
+            # 25 s keepalive keeps the NAT mapping on home routers open so the peer can reach this machine; harmless on public hosts.
             "PersistentKeepalive = 25",
             "",
         ]
     out_path = WG_DIR / "wg0.conf"
     out_path.write_text("\n".join(lines))
+
+    # The file embeds the private key, so restrict it like the key file itself.
     out_path.chmod(0o600)
     print(f"Wrote {out_path}")
     print()
@@ -167,6 +206,7 @@ def cmd_config(args):
 
 
 def cmd_status(args):
+    """Show live tunnel status by running `wg show` (needs the tunnel up; may need sudo to display peers)."""
     if not shutil.which("wg"):
         print("wg not installed -- nothing to show.")
         return
@@ -174,6 +214,7 @@ def cmd_status(args):
 
 
 def main():
+    """Parse arguments and dispatch to the cmd_* function for the chosen sub-command."""
     parser = argparse.ArgumentParser(prog="kloud-vpn", description="Self-hosted WireGuard tunnel. No third party.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

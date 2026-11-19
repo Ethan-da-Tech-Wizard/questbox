@@ -18,6 +18,18 @@ whichever side has the newer file wins. Fine for one person working from
 one machine at a time; if both machines edit the same file in the same
 window, the older edit is what gets overwritten.
 """
+
+# Fit: part of the kloud family (see the architecture note in `kloud`). `kloud` runs this script from the
+# menu wizard (option 5) and kloud-schedule runs `kloud-sync now` on every scheduled tick while the
+# machine is live. State: .kloud/sync.json {peer_host, peer_user, peer_root, last_sync}; the local storage
+# folder comes from .kloud/config.json written by `kloud init`.
+#
+# Commands: setup (save the partner's details), now (sync both ways), status (show partner and last sync).
+# Needs: rsync and ssh on both machines, and key-based ssh login to the partner already working,
+# because every call uses BatchMode (never prompts for a password; a missing key fails fast).
+# Limits: deletions are NOT propagated (no --delete), so a file removed on one side comes back from the
+# other; names are not escaped for the remote shell, so avoid spaces in the peer folder path; a file
+# being uploaded to the kloud server (".part") could be copied mid-upload.
 import argparse
 import json
 import subprocess
@@ -25,25 +37,33 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# State lives in .kloud/ next to the script, shared with kloud and kloud-schedule.
 HERE = Path(__file__).resolve().parent
 KLOUD_CONFIG = HERE / ".kloud" / "config.json"
 SYNC_CONFIG = HERE / ".kloud" / "sync.json"
 
 
 def local_root():
+    """Return this machine's kloud storage folder (the `root` saved by `kloud init`), or exit with a hint."""
     if not KLOUD_CONFIG.exists():
         sys.exit("kloud isn't set up on this machine yet -- run `kloud init` first.")
     return json.loads(KLOUD_CONFIG.read_text())["root"]
 
 
 def load_sync_config():
+    """Return the saved sync partner settings dict, or exit with a hint to run `setup` first."""
     if not SYNC_CONFIG.exists():
         sys.exit("Not set up yet -- run `kloud-sync setup` first.")
     return json.loads(SYNC_CONFIG.read_text())
 
 
-# Step 1: Configure remote peer connection endpoint and sync targets
 def cmd_setup(args):
+    """Save the partner machine's address, ssh user and storage path to sync.json.
+
+    Args: args.peer_host (e.g. its VPN address), args.peer_user, args.peer_root.
+    Overwrites previous settings and resets last_sync to None. The same command must be run on the other
+    machine with the roles swapped; this program only configures one side.
+    """
     cfg = {
         "peer_host": args.peer_host,
         "peer_user": args.peer_user,
@@ -57,23 +77,39 @@ def cmd_setup(args):
 
 
 def _rsync(src, dst):
+    """Run one rsync pass from `src` to `dst` and return the CompletedProcess (stdout/stderr captured).
+
+    Flags: -a keeps permissions and times (archive), -z compresses for slower links, --update skips files
+    that are newer on the receiving side, which is what makes the two-pass sync "newest wins". The ssh
+    options set an 8 s connect timeout and BatchMode (fail instead of asking for a password), so a
+    scheduled unattended run cannot hang on a prompt.
+    """
     return subprocess.run(
         ["rsync", "-az", "--update", "-e", "ssh -o ConnectTimeout=8 -o BatchMode=yes", src, dst],
         capture_output=True, text=True,
     )
 
 
-# Step 2: Execute bidirectional rsync pass with timestamp-based conflict resolution
 def cmd_now(args):
+    """Sync with the partner: push local changes, then pull the partner's changes.
+
+    Exits with a readable message if either pass fails. last_sync is recorded only after both passes succeed.
+    """
     root = local_root()
+
+    # rsync treats "dir/" as "the contents of dir" and "dir" as "the folder itself". The trailing slash
+    # on both sides makes the two storage folders mirror each other instead of nesting one inside the other.
     if not root.endswith("/"):
         root += "/"
     cfg = load_sync_config()
     peer_root = cfg["peer_root"] if cfg["peer_root"].endswith("/") else cfg["peer_root"] + "/"
     peer = f"{cfg['peer_user']}@{cfg['peer_host']}:{peer_root}"
 
+    # Pass 1 (push): local -> partner. Doing push before pull means a newer local edit wins, then the partner's newer files come back in pass 2.
     print(f"Pushing local changes to {cfg['peer_host']}...")
     r1 = _rsync(root, peer)
+
+    # Stop at the first failure: continuing to pull after a failed push could leave the two sides further apart.
     if r1.returncode != 0:
         sys.exit(
             f"Couldn't reach {cfg['peer_host']}. Check that its VPN tunnel is up, "
@@ -86,13 +122,14 @@ def cmd_now(args):
     if r2.returncode != 0:
         sys.exit(f"Push worked but pulling their changes back failed:\n\n{r2.stderr.strip()}")
 
+    # UTC ISO timestamp so `status` and the kloud menu show an unambiguous time.
     cfg["last_sync"] = datetime.now(timezone.utc).isoformat()
     SYNC_CONFIG.write_text(json.dumps(cfg, indent=2))
     print("Sync complete -- both machines now have the same files.")
 
 
-# Step 3: Report last synchronization timestamp and peer health status
 def cmd_status(args):
+    """Print the saved partner and the time of the last successful sync (it does not contact the partner)."""
     if not SYNC_CONFIG.exists():
         print("Not set up yet -- run `kloud-sync setup` first.")
         return
@@ -102,6 +139,7 @@ def cmd_status(args):
 
 
 def main():
+    """Parse arguments and dispatch to cmd_setup, cmd_now or cmd_status."""
     parser = argparse.ArgumentParser(prog="kloud-sync", description="Two-way rsync between two kloud machines.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
