@@ -112,6 +112,24 @@ def cmd_peer_list(args):
 
 # Step 4: Synthesize standardized wg-quick configuration files for deployment
 def cmd_config(args):
+    """
+    Renders production wg-quick tunnel interface and peer stanza configuration.
+    
+    WireGuard Protocol & Cryptokey Routing Architecture:
+      1. Noise_IK Handshake Pattern:
+         WireGuard relies on 1-RTT initiator-responder handshakes over UDP using
+         Curve25519 DH, ChaCha20-Poly1305 AEAD, and BLAKE2s hashing.
+      2. Cryptokey Routing Table (`AllowedIPs`):
+         Associates static Curve25519 public keys with permitted tunnel IP prefixes.
+         Inbound packets are decrypted and checked against AllowedIPs to verify
+         the authentic sender before delivering to the kernel networking stack.
+         Outbound packets inspect the destination IP to look up the target peer's
+         public key for encryption.
+      3. Stateful NAT Hole-Punching (`PersistentKeepalive = 25`):
+         Sends periodic authenticated empty packets every 25 seconds to keep
+         stateful firewall / NAT translation table entries alive, allowing
+         bidirectional communication across home routers and mobile carriers.
+    """
     if not SELF_PATH.exists():
         sys.exit("Run `kloud-vpn init` first.")
     self_cfg = json.loads(SELF_PATH.read_text())
